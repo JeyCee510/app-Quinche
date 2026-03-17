@@ -5,14 +5,13 @@ from datetime import datetime, timedelta
 import os
 import json
 import sqlite3
-from google import genai
-from google.genai import types
+from groq import Groq
 
 # ==========================================
 # CONFIGURACIÓN SEGURA (SOLO IA)
 # ==========================================
-# En la nube, esta llave se lee desde los "Secrets"
-GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+# En la nube (Streamlit Community Cloud), esta llave se lee desde los "Secrets"
+GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 
 # ==========================================
 # LECTURA DE BASE DE DATOS (SOLO LECTURA)
@@ -216,54 +215,80 @@ with tab2:
 
 # --- TAB 3: ASISTENTE AI ---
 with tab3:
-    st.markdown("### 🤖 Asistente Financiero AI (Gemini 2.5)")
-    st.write("Hazle preguntas a la inteligencia artificial sobre el estado financiero de El Quinche. Analizará todas las bases de datos al instante.")
-    
-    # Botón de reseteo manual de la conversación
-    if st.button("🔄 Iniciar nueva conversación"):
-        if "chat_session" in st.session_state:
-            del st.session_state.chat_session
-        st.success("¡Memoria refrescada! Puedes empezar un nuevo tema.")
+    col_ia1, col_ia2 = st.columns([4, 1])
+    with col_ia1:
+        st.markdown("### 🤖 Asistente Financiero AI (Groq + Llama 3.3)")
+        st.write("Hazle preguntas a la inteligencia artificial sobre el estado financiero de El Quinche. Analizará todas las bases de datos al instante.")
+    with col_ia2:
+        if st.button("🔄 Borrar Memoria", use_container_width=True):
+            st.session_state.messages_ai = []
+            st.rerun()
 
-    if "chat_session" not in st.session_state and not df.empty:
-        try:
-            saldo_str = f"SALDO BANCARIO ACTUAL CALCULADO: ${saldo_real_actual:.2f}\n" if 'saldo_real_actual' in locals() else ""
-            contexto_datos = f"--- BASE DE DATOS ACTUAL DEL QUINCHE ---\nMOV:\n{df.to_csv(index=False)}\nINV:\n{df_inv.to_csv(index=False)}\nCXC:\n{df_act.to_csv(index=False)}\n{saldo_str}"
-            
-            system_instruction = """
-            Eres el analista financiero corporativo de 'El Quinche'. 
-            Responde basándote SOLO en el CSV proporcionado en tu contexto. 
-            Prohibido hablar, opinar o responder sobre cualquier tema que no sean los datos financieros de El Quinche. Si te preguntan algo fuera de esto, di: "Lo siento, soy el Asistente Financiero de El Quinche. Por políticas de seguridad, solo analizo la base de datos financiera."
-            Sé directo, profesional, usa el símbolo $ para montos.
-            """
-            
-            # --- EL ARREGLO PARA QUE LA IA NO SE DESCONECTE ---
-            if "gemini_client" not in st.session_state:
-                st.session_state.gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-                
-            config_gen = types.GenerateContentConfig(system_instruction=system_instruction)
-            
-            st.session_state.chat_session = st.session_state.gemini_client.chats.create(model="gemini-2.5-flash", config=config_gen)
-            st.session_state.chat_session.send_message(f"Guarda esto, no respondas:\n{contexto_datos}")
-        except Exception as e:
-            st.error("La IA se está inicializando o hubo un error al cargar el contexto. Verifica tu API Key en los secretos.")
+    if "messages_ai" not in st.session_state:
+        st.session_state.messages_ai = []
 
     # Mostrar historial
-    if "chat_session" in st.session_state:
-        # Mostramos desde el índice 2 para ocultar la inyección invisible de la base de datos
-        for msg in st.session_state.chat_session.get_history()[2:]: 
-            role = "user" if msg.role == "user" else "assistant"
-            with st.chat_message(role):
-                st.markdown(msg.parts[0].text)
+    for message in st.session_state.messages_ai:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-        # Caja de chat
-        if prompt := st.chat_input("Ej: ¿Cuánto he gastado en servicios básicos este año?"):
-            with st.chat_message("user"):
-                st.markdown(prompt)
-            with st.chat_message("assistant"):
-                try:
-                    with st.spinner('Analizando millones de datos...'):
-                        response = st.session_state.chat_session.send_message(prompt)
-                        st.markdown(response.text)
-                except Exception as e:
-                    st.error(f"Hubo un problema procesando tu pregunta con la IA: {e}")
+    # Caja de chat
+    if prompt := st.chat_input("Ej: ¿Cuánto he gastado en servicios básicos este año?"):
+        st.session_state.messages_ai.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            try:
+                with st.spinner('Analizando los datos...'):
+                    # Preparación de datos (solo lo esencial para no exceder contexto de Groq)
+                    if not df.empty:
+                        df_ia = df[['Fecha', 'Tipo', 'Categoría', 'Monto', 'Concepto']].copy()
+                        df_ia['Fecha'] = pd.to_datetime(df_ia['Fecha']).dt.strftime('%Y-%m-%d')
+                        csv_master = df_ia.to_csv(index=False)
+                    else:
+                        csv_master = "No hay registros en la base de datos maestra."
+
+                    csv_inv = df_inv[['Fecha Inicio', 'Entidad', 'Monto', 'Estado']].to_csv(index=False) if not df_inv.empty else "No hay inversiones registradas."
+                    csv_prov = pd.DataFrame(datos_prov_global).to_csv(index=False) if datos_prov_global else "No hay provisiones registradas."
+                    saldo_str = f"SALDO BANCARIO ACTUAL CALCULADO: ${saldo_real_actual:.2f}\n" if 'saldo_real_actual' in locals() else ""
+
+                    client = Groq(api_key=GROQ_API_KEY)
+                    system_prompt = f"""
+                    Eres el analista de datos y asistente financiero del dashboard 'El Quinche'. 
+                    Tu misión es responder las dudas del usuario basándote ESTRICTAMENTE en los datos CSV que se te proporcionan a continuación.
+                    
+                    DATOS DE MOVIMIENTOS (Ingresos y Gastos):
+                    {csv_master}
+                    
+                    DATOS DE INVERSIONES:
+                    {csv_inv}
+                    
+                    FONDOS DE PROVISIONES:
+                    {csv_prov}
+                    
+                    {saldo_str}
+                    
+                    REGLAS IMPORTANTES Y PROHIBICIONES ABSOLUTAS:
+                    1. TIENES PROHIBIDO TAJANTEMENTE hablar, discutir o responder sobre CUALQUIER tema que no esté estrictamente relacionado con este dashboard financiero, los datos proporcionados, finanzas o contabilidad del proyecto 'El Quinche'. Si el usuario pregunta sobre programación, historia, recetas, chistes o cualquier otra cosa fuera de contexto, debes negarte educada pero firmemente.
+                    2. NO le digas al usuario cómo usar el dashboard. Lee tú mismo los datos y dale la respuesta final.
+                    3. Si te preguntan por un mes o categoría, filtra mentalmente el archivo CSV, suma los montos y entrégale el valor exacto.
+                    4. Sé amigable, directo y claro. Usa el símbolo $ para los montos.
+                    5. Responde siempre en español.
+                    """
+
+                    messages_to_send = [{"role": "system", "content": system_prompt}] + st.session_state.messages_ai
+
+                    completion = client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=messages_to_send,
+                        temperature=0.1, # Temperatura baja para que sea preciso con los números
+                        max_tokens=600,
+                    )
+
+                    response = completion.choices[0].message.content
+                    st.markdown(response)
+                    st.session_state.messages_ai.append({"role": "assistant", "content": response})
+
+            except Exception as e:
+                st.error(f"Hubo un problema procesando tu pregunta con la IA: {e}")
