@@ -236,7 +236,7 @@ with tab3:
 
         with st.chat_message("assistant"):
             try:
-                with st.spinner('Analizando los datos...'): [cite: 49]
+                with st.spinner('Analizando los datos...'): 
                     if not df.empty:
                         df_ia = df[['Fecha', 'Tipo', 'Categoría', 'Monto', 'Concepto']].copy() [cite: 49]
                         df_ia['Fecha'] = pd.to_datetime(df_ia['Fecha']).dt.strftime('%Y-%m-%d') [cite: 49]
