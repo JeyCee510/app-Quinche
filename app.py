@@ -11,7 +11,7 @@ from google.genai import types
 # ==========================================
 # CONFIGURACIÓN SEGURA (SOLO IA)
 # ==========================================
-# En la nube, esta llave se leerá desde "Advanced Settings"
+# En la nube, esta llave se lee desde los "Secrets"
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 
 # ==========================================
@@ -31,7 +31,7 @@ def cargar_tabla(nombre_tabla):
             if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
         return df
     except Exception:
-        # Retorna un DataFrame vacío si no encuentra la tabla
+        # Retorna un DataFrame vacío si no encuentra la tabla o hay error
         return pd.DataFrame()
 
 df = cargar_tabla("master")
@@ -171,13 +171,13 @@ with tab1:
             if not df_filtered.empty:
                 df_flujo = df_filtered.groupby([df_filtered['Fecha'].dt.to_period('M'), 'Tipo'])['Monto'].sum().reset_index()
                 df_flujo['Fecha'] = df_flujo['Fecha'].astype(str)
-                st.plotly_chart(px.bar(df_flujo, x='Fecha', y='Monto', color='Tipo', barmode='group', color_discrete_map={'Ingreso':'#709b8b', 'Gasto':'#c9806b'}))
+                st.plotly_chart(px.bar(df_flujo, x='Fecha', y='Monto', color='Tipo', barmode='group', color_discrete_map={'Ingreso':'#709b8b', 'Gasto':'#c9806b'}), use_container_width=True)
         
         with col_chart2:
             st.markdown("#### Distribución de Gastos")
             df_gastos = df_filtered[df_filtered['Tipo'] == 'Gasto']
             if not df_gastos.empty: 
-                st.plotly_chart(px.pie(df_gastos, values='Monto', names='Categoría', hole=0.4))
+                st.plotly_chart(px.pie(df_gastos, values='Monto', names='Categoría', hole=0.4), use_container_width=True)
             else: 
                 st.info("No hay gastos registrados en este periodo con los filtros actuales.")
         
@@ -219,6 +219,12 @@ with tab3:
     st.markdown("### 🤖 Asistente Financiero AI (Gemini 2.5)")
     st.write("Hazle preguntas a la inteligencia artificial sobre el estado financiero de El Quinche. Analizará todas las bases de datos al instante.")
     
+    # Botón de reseteo manual de la conversación
+    if st.button("🔄 Iniciar nueva conversación"):
+        if "chat_session" in st.session_state:
+            del st.session_state.chat_session
+        st.success("¡Memoria refrescada! Puedes empezar un nuevo tema.")
+
     if "chat_session" not in st.session_state and not df.empty:
         try:
             saldo_str = f"SALDO BANCARIO ACTUAL CALCULADO: ${saldo_real_actual:.2f}\n" if 'saldo_real_actual' in locals() else ""
@@ -231,16 +237,20 @@ with tab3:
             Sé directo, profesional, usa el símbolo $ para montos.
             """
             
-            client = genai.Client(api_key=GEMINI_API_KEY)
+            # --- EL ARREGLO PARA QUE LA IA NO SE DESCONECTE ---
+            if "gemini_client" not in st.session_state:
+                st.session_state.gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+                
             config_gen = types.GenerateContentConfig(system_instruction=system_instruction)
             
-            st.session_state.chat_session = client.chats.create(model="gemini-2.5-flash", config=config_gen)
+            st.session_state.chat_session = st.session_state.gemini_client.chats.create(model="gemini-2.5-flash", config=config_gen)
             st.session_state.chat_session.send_message(f"Guarda esto, no respondas:\n{contexto_datos}")
         except Exception as e:
             st.error("La IA se está inicializando o hubo un error al cargar el contexto. Verifica tu API Key en los secretos.")
 
     # Mostrar historial
     if "chat_session" in st.session_state:
+        # Mostramos desde el índice 2 para ocultar la inyección invisible de la base de datos
         for msg in st.session_state.chat_session.get_history()[2:]: 
             role = "user" if msg.role == "user" else "assistant"
             with st.chat_message(role):
