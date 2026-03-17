@@ -58,7 +58,6 @@ total_inmovilizado_global = sum(d["Acumulado"] for d in datos_prov_global)
 # ==========================================
 # INTERFAZ DE USUARIO (VISUALIZADOR)
 # ==========================================
-# CAMBIO 3: initial_sidebar_state="expanded" hace que los filtros sean visibles de inmediato
 st.set_page_config(
     page_title="Dashboard Quinche", 
     layout="wide", 
@@ -112,7 +111,6 @@ col_btn1.button("✅ Todas", on_click=select_all_cats)
 col_btn2.button("❌ Ninguna", on_click=clear_all_cats)
 categorias_seleccionadas = st.sidebar.multiselect("Categorías visibles:", options=CATEGORIAS_EXACTAS, key='filtro_categorias')
 
-# CAMBIO 1: Nombre de la pestaña actualizado a "Detalle de Movimientos"
 tab1, tab2, tab3 = st.tabs(["📊 Dashboard Principal", "🗂️ Detalle de Movimientos", "🤖 Asistente IA"])
 
 # --- TAB 1: DASHBOARD ---
@@ -220,7 +218,6 @@ with tab3:
         st.markdown("### 🤖 Asistente Financiero AI")
         st.write("Analizo las bases de datos de El Quinche para responder tus dudas.")
     with col_ia2:
-        # CAMBIO 2: Nombre del botón más amigable
         if st.button("🧼 Limpiar pantalla", width="stretch"):
             st.session_state.messages_ai = []
             st.rerun()
@@ -245,10 +242,10 @@ with tab3:
 
                     csv_inv = df_inv[['Fecha Inicio', 'Entidad', 'Monto', 'Estado']].to_csv(index=False) if not df_inv.empty else "Sin inversiones."
                     csv_prov = pd.DataFrame(datos_prov_global).to_csv(index=False) if datos_prov_global else "Sin provisiones."
-                    saldo_str = f"SALDO BANCARIO ACTUAL: ${saldo_real_actual:.2f}\n" if 'saldo_real_actual' in locals() else ""
+                    saldo_str = f"SALDO BANCARIO ACTUAL: ${saldo_real_actual:.2f}\\n" if 'saldo_real_actual' in locals() else ""
 
                     client = Groq(api_key=GROQ_API_KEY)
-                    system_prompt = f"Eres el analista financiero de 'El Quinche'. Responde usando estos datos:\n{csv_master}\n{csv_inv}\n{csv_prov}\n{saldo_str}\nReglas: Solo temas financieros de este proyecto. Sé directo y usa $."
+                    system_prompt = f"Eres el analista financiero de 'El Quinche'. Responde usando estos datos:\\n{csv_master}\\n{csv_inv}\\n{csv_prov}\\n{saldo_str}\\nReglas: Solo temas financieros de este proyecto. Sé directo y usa $."
 
                     messages_to_send = [{"role": "system", "content": system_prompt}] + st.session_state.messages_ai
                     completion = client.chat.completions.create(model="llama-3.3-70b-versatile", messages=messages_to_send, temperature=0.1, max_tokens=600)
