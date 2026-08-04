@@ -46,6 +46,15 @@ Decisiones técnicas o de producto que ya están tomadas y no hace falta volver 
 - **2026-05-05** — NO migrar a OpenAI Assistants. Quedamos en Make AI Agent.
   - Por qué: JC decidió no asumir el costo de migración. La opción queda descartada.
   - Cómo aplicar: optimizar el system prompt y tools dentro del módulo AI Agent existente.
+- **2026-06-11** — Todo envío desde el Inbox PWA (texto, plantilla, pedir-docs, acción rápida, adjunto) exige `humano_activo=true` (Camila tomó el thread).
+  - Por qué: si Camila manda una plantilla sin tomar y el cliente responde, contesta el bot sin contexto. JC eligió restringir sobre permitir reactivación proactiva sin tomar.
+  - Cómo aplicar: guard 409 `handoff_inactivo` en send, send-template, pedir-docs, accion-rapida y send-media. Excepción: el template de handoff lo manda `/take` vía lib directamente. Blast e invitar-feria usan la lib, no estos endpoints, y no se afectan.
+- **2026-06-11** — Acciones rápidas del inbox (brochure, link ubicación Quito, link dimensiones mesa) van vía webhook Make `pwa_acciones_camila` reutilizando los subscenarios del bot, NO duplicando contenido en la PWA.
+  - Por qué: una sola fuente de verdad del contenido (los subscenarios `_sb`); mismo patrón que `enviar_contrato_manual`.
+  - Cómo aplicar: eventos `enviar_brochure_manual` (requiere `feria_record_id`), `enviar_link_ubicacion_manual`, `enviar_link_dimensiones_manual`; payload siempre con `cliente_wa_number`. Requieren ventana 24h abierta (mandan texto free-form). Ramas = módulos 16/17/18 del scenario 5086803.
+- **2026-06-11** — Adjuntos libres del inbox: bucket público `inbox-media` en Supabase Storage + columnas `media_url/media_tipo/media_filename` en `conversaciones` + `sendMedia()` en lib/whatsapp.ts.
+  - Por qué: Camila necesitaba mandar fotos/PDFs ad hoc durante handoff; Cloud API acepta media por link público dentro de ventana 24h.
+  - Cómo aplicar: endpoint `/api/inbox/messages/send-media` (jpg/png/webp/pdf, máx 10 MB, guards handoff+ventana). El texto del composer va como caption.
 
 ---
 
@@ -124,6 +133,32 @@ Cosas que JC corrigió, validó o que descubrimos durante el trabajo y conviene 
   - Cómo aplicar: el agente puede llamar la tool con reserva_record_id, cliente_wa_number, media_id. Resultado: PATCH Reservas (Estado pago=Captura Recibida, monto extraído, referencia) + POST WA al operador con imagen y caption "CAPTURA PAGO POR VALIDAR | Cliente: ... | Reserva: ... | Monto esperado: ... | Monto extraído: ...". Devuelve `info_captura` con monto_extraido, match_total, mensaje_operador_id.
 - **2026-05-05 [crítico, repetido enésima vez]** — JC requiere tuteo neutro estricto. Volví a meter voseo ("mandá", "pasame", "abrime", "copiame", "querés"). NO PASA MÁS. Solo formas tuteoadas con tilde correcta: "manda", "pásame", "ábreme", "cópiame", "quieres". Para imperativos enclíticos siempre tilde: "confírmame", "fíjate", "pásame".
   - Cómo aplicar: revisar cada respuesta antes de mandarla, especialmente imperativos. Si dudo, preferir indicativo en vez de imperativo ("puedes pasarme" mejor que "pásame" si no estoy seguro).
+- **2026-06-11** — El catálogo `pwa/lib/inbox/templates.ts` estaba desincronizado de los templates reales aprobados en Meta en 6 de 8 plantillas (cantidad de variables distinta): esos envíos desde el modal fallaban con error 132000 de Meta.
+  - Por qué: el catálogo se escribió de memoria al armar el inbox, sin contrastar con `TEMPLATES_HSM.md` (la fuente de verdad de lo aprobado).
+  - Cómo aplicar: cualquier cambio a plantillas se hace primero en Meta/`TEMPLATES_HSM.md` y se replica 1:1 en `templates.ts` (cantidad Y orden de variables). Sincronizado completo el 2026-06-11.
+- **2026-06-11** — `validate_blueprint_schema` (Make MCP) rechaza `scheduling` e `interface` a nivel raíz del blueprint, aunque `scenarios_get` los devuelva.
+  - Por qué: el schema del blueprint solo acepta `name`, `flow`, `metadata`; el resto son propiedades del scenario, no del blueprint.
+  - Cómo aplicar: antes de `scenarios_update`, quitar `scheduling` e `interface` del objeto blueprint que devuelve `scenarios_get`. Ciclo seguro usado y validado hoy: validate → deactivate → update (blueprint completo) → activate → get de verificación.
+- **2026-06-11** — Carrera en `/release` del inbox corregida: el resumen del handoff ahora se genera y persiste ANTES de cerrar el handoff (orden viejo: cerrar → resumir dejaba ventana donde el bot respondía sin contexto).
+  - Cómo aplicar: si se toca ese endpoint, mantener el orden leer mensajes → resumir → persistir con `pending_summary_injection=true` → RPC de cierre. Verificado: la RPC `tool_cerrar_handoff_humano_sb` no toca los campos del summary.
+- **2026-06-11** — Los subscenarios `tool_enviar_link_ubicacion_quito_sb` (5092575) y `tool_enviar_link_dimensiones_mesa_sb` (5092576) NO registraban su envío en `conversaciones` (a diferencia del brochure). Detectado por JC en el test E2E: los videos no aparecían en el thread. Corregido agregando módulo de insert (id 4, `enviado_por=sistema`, con wamid) a ambos, espejo del patrón del brochure; el endpoint `accion-rapida` del PWA ya NO inserta filas (solo audit_log) para evitar duplicados.
+  - Cómo aplicar: regla general — toda tool que envíe algo por WhatsApp debe registrar su propia fila en `conversaciones` dentro del subscenario; el caller (bot o PWA) no duplica el registro. Revisar esto al crear tools nuevas de envío.
+- **2026-06-12** — Cobertura de notificaciones ampliada (migración `notifs_cliente_nuevo_y_captura`): (a) `cliente_nuevo` — primer mensaje histórico de un número notifica SIEMPRE, aunque atienda el bot, sin requisito de push activo; (b) `captura_recibida` — trigger nuevo `tg_reservas_captura_notif` sobre `captura_pdf_url` null→valor, porque el flujo real deja `estado_pago='pendiente'` y la rama por estado nunca disparaba. `mensaje_inbound` (handoff activo) queda igual.
+  - Cómo aplicar: tipos de notificación vigentes: reserva_nueva, reserva_pagada, reserva_expirada, captura_recibida, cliente_nuevo, mensaje_inbound. Validado con test sintético (update de captura en reserva expirada → 2 notifs → revertido y limpiado). Pendiente de evaluar a futuro: aviso de "cliente esperando >15 min" (requiere cron, no trigger).
+- **2026-06-12 [crítico]** — El Web Push del PWA NUNCA funcionó vía trigger: el middleware redirigía `/api/push/dispatch` a `/login` (pg_net no tiene cookies de sesión) → 307 → POST a /login → 405. Presente desde el init del PWA (15-may). Enmascarado porque las notificaciones in-app (campana/realtime) sí funcionaban. Detectado al investigar "13 días sin notificaciones" — que además resultó ser falta de eventos calificables: solo notifica reserva nueva, cambio estado pago e inbound con handoff ACTIVO (90 inbounds del bot en 13 días = cero notifs por diseño).
+  - Cómo aplicar: `/api/push/dispatch` está exento en `lib/supabase/middleware.ts` (auth propia por `x-dispatch-secret`). Cualquier endpoint server-to-server futuro (webhooks, triggers pg_net) necesita la misma exención. Para probar el pipe completo: insertar fila en `notificaciones` y revisar `net._http_response` (debe dar 200, no 405/307). Ojo: pg_net purga respuestas viejas, no sirve para histórico.
+  - **VALIDADO E2E [2026-06-12]** tras deploy del fix: dispatch devolvió `200 {ok:true, sent:2, total:2, expiradas:0}` — las 2 suscripciones de JC (del 19-may) seguían vivas y recibieron el push. (a) botón "registrar" en threads no registrados (nombre pre-cargado del perfil WA), (b) botón "+ nuevo chat" para números que nunca han escrito — registra (nombre+WhatsApp vía RPC `upsert_vendedor`), toma el thread en silencio y abre el selector de plantillas para el primer contacto.
+  - Por qué: Camila necesitaba contactar números nuevos con plantillas preaprobadas sin pasar por /vendedores/nuevo.
+  - Cómo aplicar: endpoint `/api/inbox/vendedores/registro-rapido` + `modal-registro.tsx`. El resto de campos del vendedor se completa después en /vendedores. El "tomar en silencio" del nuevo chat usa `send_template:false` (no tiene sentido avisar handoff a quien nunca conversó).
+- **2026-06-12** — Los templates de handoff (`wa_handoff_a_humano_v1` al tomar, `wa_handoff_a_bot_v1` al devolver) solo se enviaban con ventana 24h CERRADA: en el caso común (cliente activo, ventana abierta) el cliente nunca se enteraba de que hablaba con un humano. Detectado por JC en test E2E.
+  - Cómo aplicar: ahora se envían SIEMPRE (UTILITY no tiene costo dentro de ventana abierta), salvo opt-out (`send_template:false` / devolver en silencio), thread ya tomado (take) o sin handoff previo (release). `{{3}}` del template usa `nombreOperador(email)` — mapa en take/route.ts: pulgonquito→Camila, jclira→Juan Cristóbal, fallback "una persona del equipo". Al agregar operadoras nuevas, ampliar ese mapa.
+- **2026-06-11 [crítico]** — `scenarios_update` BORRA la interface (input/output) de un sub-escenario callable, aunque el blueprint se mande completo y válido. Matiz importante a la entrada del 2026-05-18 ("update con blueprint completo es seguro"): el blueprint sí persiste intacto, pero la interface del scenario se resetea a vacía porque el schema del blueprint no la acepta (`must NOT have additional properties`). Síntoma: el caller (CallSubscenario) pasa los inputs pero llegan vacíos → DataError Bad Request en el primer módulo que los usa (a Meta llegó `to:""`). Costó un roundtrip de debugging con executions_list.
+  - Cómo aplicar: después de CADA `scenarios_update` a un sub-escenario callable, re-aplicar la interface con `scenarios_set-interface` (input + output) y correr `scenarios_run` responsive con inputs reales para verificar. Los scenarios webhook (como pwa_acciones_camila) no sufren esto porque su interface ya es vacía.
+- **2026-06-11** — El resumen del handoff (opción C) ignoraba las filas `enviado_por=sistema`: contaba mal los mensajes procesados (JC vio "1 mensaje" cuando se mandaron ~5) y, peor, el bot no se enteraba del material ya enviado (brochure, videos, contrato) y podía re-ofrecerlo.
+  - Cómo aplicar: `construirTranscripcion` en `handoff-summary.ts` ahora incluye filas `sistema` como "sistema (envío automático al cliente): ..." y el prompt instruye ponerlas en "Qué NO debe re-ofrecer el bot". Solo se ignora `bot` (pausado durante handoff). Si se agregan nuevos `enviado_por`, revisar esta función.
+- **2026-06-12** — Schedulers `scheduler_recordatorio_pago_sb` (5067091) y `scheduler_expirar_reservas_sb` (5069315) bajados de 900s (15 min) a 1800s (30 min). Consumo Make: 384 → 192 ops/día (-50% del piso fijo de schedulers).
+  - Por qué: JC notó que entre ambos schedulers consumían tantos créditos Make como `wa_inbound`. Cada ejecución gasta 2 ops mínimo (GET Supabase + BasicFeeder) aunque el array de reservas matching venga vacío. A 15 min × 96 corridas/día × 2 schedulers × 2 ops = 384 ops/día garantizadas, haya tráfico o no. `wa_inbound` solo corre con mensajes reales — por eso los schedulers "competían" en consumo durante días de poca actividad.
+  - Cómo aplicar: TTL de reserva pendiente sigue siendo 6h (memoria 21-may), el recordatorio se manda cuando faltan ≤60 min para expirar. Con interval 30 min, el cliente recibe el recordatorio entre 30 y 60 min antes de expirar (ventana antes era 15-60 min). Aceptable. Si en el futuro JC quiere bajar más el consumo, combinar ambos schedulers en uno solo con router (GET único que traiga reservas con TTL pasado Y con TTL ≤60 min) ahorraría otros 96 ops/día.
 
 ---
 
@@ -131,9 +166,12 @@ Cosas que JC corrigió, validó o que descubrimos durante el trabajo y conviene 
 
 Snapshot vivo: en qué fase estamos, qué falta, qué está bloqueado. Se actualiza con frecuencia. **Esta sección sí se reescribe** (no es log apendizado), pero antes de reescribirla, mover lo desplazado a "Cambios de contexto" si tiene valor histórico.
 
-- **Última actualización:** 2026-05-27 (sesión larga: opción C de handoff DESPLEGADA Y VALIDADA E2E EN PRODUCCIÓN con OpenAI real, incluyendo fix de cifras literales). Tras handoff, el bot ahora recibe contexto estructurado del intercambio humano y respeta cifras textuales sin recalcular. Cerrado el ciclo PWA → Supabase → wa_inbound → bot, con validación de descuento atípico de $12 ($48-$12=$36 correcto). Único pendiente menor: banner gris UI cosmético no aparece tras release (probable cache Service Worker).
-- **Anterior:** 2026-05-24 (sesión larga 21-24/05: 12 plantillas HSM + docx Camila + reorganización integral knowledge↔prompt + decisión PWA inbox propia + 9 bugs cerrados incluyendo dedup wamid, JSON inválido captura pago, descriptions faltantes tools, doble espacio output, y detección de comida con REGLA GLOBAL al TOP del prompt). Detalle en `compound_review_2026-05-24.md`.
-- **Fase actual:** Bot WhatsApp v2 en producción estable con **prompt v27** activo (REGLA GLOBAL DE COMIDA al inicio + 3e-bis subsumida + fix ropa/mesa-comida conservador). 3 archivos knowledge activos (`pulgon_faq.md`, `pulgon_sedes.md`, `pulgon_reglamento.md`). 11 tools en el AI Agent con descriptions completas y nombres limpios (sin `tool_` ni `_sb`). Dedup wamid activo vía tabla Supabase `processed_wamids` + módulo 99 en wa_inbound. Capturas de pago funcionando (fix fallback `"?"` → `"n/a"`). Pendiente: cablear templates HSM `recordatorio_pago` y `reserva_expirada` (#5, #6), display name Meta en revisión (#19), sincronizar `SYSTEM_PROMPT_v6.md` con v27 vivo, confirmar con Camila si mesa de comida permite productos no alimenticios.
+- **Última actualización:** 2026-06-12 (cierre de sesión 11/12-jun, TODO desplegado y validado E2E por JC. 7 bugs corregidos — 2 críticos: **Web Push muerto desde el init del PWA** (middleware redirigía /api/push/dispatch a /login → 405) y **catálogo templates.ts desincronizado de Meta en 6/8 plantillas**. 4 features nuevas: acciones rápidas brochure/ubicación/mesas, adjuntos libres imagen/PDF, registro rápido de vendedores + "nuevo chat", notificaciones `cliente_nuevo` y `captura_recibida`. Templates de handoff ahora avisan SIEMPRE al cliente con nombre real de operadora; `ModalTomar` con vista previa reemplaza al window.prompt. Detalle completo en `compound_review_2026-06-12.md`.)
+- **Anterior:** 2026-06-01 (cierre de sesión 27-may al 1-jun: critical Supabase RLS sobre processed_wamids resuelto, diagnóstico de E2E real del 29-may con 9 bugs detectados, **3 fases de fix arquitectónico aplicadas — trigger DB para sync sesiones, RPC upsert_vendedor con COALESCE, prompt v28 con 6 cambios**). Detalle en `compound_review_2026-06-01.md`.
+- **Anterior 2:** 2026-05-27 (sesión larga: opción C de handoff DESPLEGADA Y VALIDADA E2E EN PRODUCCIÓN con OpenAI real, incluyendo fix de cifras literales). Tras handoff, el bot recibe contexto estructurado del intercambio humano y respeta cifras textuales sin recalcular. Cerrado el ciclo PWA → Supabase → wa_inbound → bot, con validación de descuento atípico de $12 ($48-$12=$36 correcto). Único pendiente menor: banner gris UI cosmético no aparece tras release (probable cache Service Worker).
+- **Anterior 3:** 2026-05-24 (sesión larga 21-24/05: 12 plantillas HSM + docx Camila + reorganización integral knowledge↔prompt + decisión PWA inbox propia + 9 bugs cerrados incluyendo dedup wamid, JSON inválido captura pago, descriptions faltantes tools, doble espacio output, y detección de comida con REGLA GLOBAL al TOP del prompt). Detalle en `compound_review_2026-05-24.md`.
+- **Anterior 4:** 2026-05-28/29 (sesion maraton ~13.5h, 49 tareas: Oleadas 2-3 HSM, reserva manual PWA, defensas anti-silencio, home rediseno ejecutivo, guia Camila docx, repo `pulgon-agent-docs` creado, bug Make AI Agent Beta con escalar_reclamo descartado y reemplazado por notificar_humano+handoff manual). Detalle en `compound_review_2026-05-29.md`.
+- **Fase actual:** Bot WhatsApp v2 en producción con **prompt v28** activo (cambios respecto v27: bullet markdown PROHIBIDO con ejemplo MAL/BIEN, sección 4 reescrita con `encontrado_antes` flag + prohibición "fallo técnico" + prohibición "ya estás registrado", sección 3c con ejemplo concreto frase corrida, sección 3d frase EXACTA OBLIGATORIA para perchas, nueva sección 7b "cliente quiere pagar → consulta sesión y reenvía", sección 8 "trigger DB auto-sync"). 3 archivos knowledge activos. 11 tools en el Agent. Dedup wamid activo con RLS. **Trigger `trg_sync_sesion_reserva` en `reservas`** → sesiones se materializan solas. **RPC `upsert_vendedor`** en Supabase → preserva datos existentes vía COALESCE. Subscenario `tool_registrar_vendedor_sb` refactorizado de 5 a 3 módulos. Pendiente: templates HSM (#5, #6), display name Meta (#19), sincronizar SYSTEM_PROMPT del repo a v28 (#32), confirmar con Camila mesa comida + no alimenticios (#33), implementar `pago_validado_sb` completo con mensaje + adjuntos (#38).
 - **Tools E2E en producción al 2026-05-11:**
   - `consultar_ferias_activas` (4855789) — ahora devuelve precios, horarios, mesa comida.
   - `buscar_vendedor` (4877070).
@@ -359,6 +397,44 @@ Snapshot vivo: en qué fase estamos, qué falta, qué está bloqueado. Se actual
 - **2026-05-27 — Aprendizaje IML Make: `if(cond; then; )` con else vacío es aceptado por la UI y se normaliza.** Pegué `if(...; then; "")` con string vacío explícito, Make UI lo guardó como `if(...; then; )` sin el `""`. En runtime evaluó correctamente al else, sin imprimir "undefined" ni romper el mapper. Conclusión: ambos formatos funcionan en Make IML. Documentado para no perder tiempo si vuelve a aparecer.
 - **2026-05-27 — Patrón validado: extender un RPC Supabase existente es preferible a agregar un módulo HTTP nuevo en wa_inbound.** Para la opción C, en vez de agregar un GET HTTP a `/rest/v1/handoffs` antes del agente, extendí `tool_estado_handoff_sb` para que devuelva los 3 campos nuevos. JC solo tuvo que tocar 2 cosas en Make UI: modificar el field `Input` del agente y agregar 1 módulo HTTP post-agente (para limpiar el flag). Mucho menos riesgo de romper el blueprint que agregar 2 módulos HTTP. **Aplicar este patrón en futuros cambios al wa_inbound: si Supabase ya tiene una RPC que se llama desde Make, extender la RPC en vez de agregar módulos.**
 - **2026-05-27 — Bug abierto cosmético: banner gris "Resumen del handoff guardado" no aparece tras `/release` exitoso.** El backend funciona (summary se genera y persiste), pero el `setAviso(...)` en `inbox-client.tsx` no rendea o se auto-cierra antes de ser visible. Causa probable: cache del Service Worker (serwist) sirviendo bundle viejo pese al deploy en Vercel. Mitigación: hard refresh PWA → verificar SW update. No-bloqueante, la pieza C funciona sin el banner.
+- **2026-05-27 — CRÍTICO Supabase advisor: `processed_wamids` sin RLS.** Tabla creada 22/05 sin RLS (decisión "no tiene datos sensibles") pero el advisor escanea todo el schema public y dispara correo CRITICAL si falta. Fix: `ENABLE ROW LEVEL SECURITY` + 2 policies (anon INSERT con CHECK true, anon SELECT con USING true) para mantener el módulo 99 de wa_inbound funcionando (necesita ambas porque usa `Prefer: return=representation`). DELETE/UPDATE bloqueados a anon. service_role bypassa RLS. Validado con curl real: comportamiento idéntico al previo, 186 wamids preservados. **Aprendizaje:** toda tabla en schema public DEBE tener RLS habilitada desde su creación, aún si parece "interna". Patrón aplicable a futuras tablas.
+- **2026-05-29 — Bug E2E real (JC como cliente de prueba): bot perdió contexto entre turnos, no actualizó datos del vendedor, escaló "fallo técnico" sin explicar.** Conversación de 22 turnos donde el bot rompió en 3 ejes: (A) sesión vacía en DB porque LLM no invocaba `actualizar_sesion` consistentemente; (B) `tool_registrar_vendedor_sb` con encontrado=true solo devolvía record_id sin UPDATE → cédula y email quedaron NULL aunque el cliente los reenvió; (C) cuando faltaba la cédula, el bot decía "fallo técnico, voy a avisar al equipo" en lugar de pedirla específicamente; (D) cuando cliente dijo "quiero pagar", bot escalaba en lugar de consultar la reserva pendiente. Plan acordado: 4 fases de fix priorizadas con approach **lógica determinística en DB > pelear con el LLM**.
+- **2026-06-01 — Fase 1 aplicada: trigger `sync_sesion_from_reserva` en `reservas` AFTER INSERT/UPDATE.** Elimina dependencia del LLM para persistir sesiones. La función mapea `estado_pago` → `estado_actual`, hace UPSERT por thread_id, casts UUID→text porque sesiones tiene esas FKs como text (legacy del refactor 14/05). EXCEPTION handler garantiza que un fallo del trigger no rompa el INSERT/UPDATE de la reserva. Backfill ejecutado con `UPDATE reservas SET updated_at = updated_at`: de 1 sesión previa a 3 materializadas. **Aprendizaje:** si el LLM no quiere invocar una tool consistentemente aunque la regla esté en el prompt, hacé la lógica determinística en DB. Patrón aplicable a otros casos.
+- **2026-06-01 — Fase 2 aplicada: RPC `upsert_vendedor` + refactor del subscenario `tool_registrar_vendedor_sb`.** PostgREST `Prefer: resolution=merge-duplicates` sobreescribe campos con NULL/vacío y no servía. La RPC con `COALESCE(NULLIF(EXCLUDED.col, ''), tbl.col)` preserva los valores existentes cuando el cliente reenvía datos parciales. Subscenario refactorizado de 5 módulos (GET + Router con 2 ramas + POST + 2 Returns) a 3 (Start → HTTP a RPC → Return). Output del tool cambia de `exitoso=false | error=ya_registrado` a `exitoso=true | encontrado_antes=true` — flag explícito para que el LLM sepa si es returning customer sin necesidad de verbalizarlo. **Aprendizaje:** para upsert con preservación de valores, usar COALESCE + NULLIF dentro de RPC SQL, no PostgREST upsert.
+- **2026-06-01 — Fase 3 aplicada: prompt v27 → v28 con 6 cambios integrados.** JC pidió el prompt completo en un solo bloque para pegar de una vez en lugar de 6 find/replace separados — acordado. Cambios: (1) bullet markdown PROHIBIDO con ejemplos MAL/BIEN en Estilo; (2) sección 4 reescrita con prohibición de "fallo técnico" + prohibición de "ya estás registrado" + output con `encontrado_antes`; (3) sección 3c con EJEMPLO CONCRETO frase corrida; (4) sección 3d frase EXACTA OBLIGATORIA "El Pulgón NO alquila perchas..."; (5) nueva sección 7b "cliente quiere pagar → consulta sesión y reenvía según estado_actual, sin escalar"; (6) sección 8 "trigger DB hace auto-sync, actualizar_sesion solo para notas_session". threadId v27 → v28. **Aprendizaje meta:** el prompt completo es mejor que cambios incrementales cuando son muchos. Reduce error humano. Si el prompt es enorme, paginar.
+- **2026-06-01 — Aprendizaje crítico: EXCEPTION handler en triggers Postgres** evita romper la operación original si el trigger falla. Patrón: `EXCEPTION WHEN OTHERS THEN RAISE NOTICE ...; RETURN NEW;`. Importante para triggers de sincronización que no son críticos para la transacción. Si el trigger fallaba sin handler, una reserva con error en sync de sesiones rompería todo el INSERT/UPDATE de reservas.
+- **2026-06-01 — Aprendizaje: para detectar bugs del bot, hacer E2E real como cliente** mejor que tests sintéticos. El E2E del 29/05 reveló 4 bugs críticos que ningún test sintético hubiera detectado (cliente que da datos parciales, cambia de tema, expresa frustración, dice "quiero pagar"). Patrón: cada N semanas de operación, JC o quien sea ejecuta un flujo E2E completo como cliente real desde su número desregistrado.
+- **2026-06-11 — Los 2 scenarios `tool_enviar_link_*_sb` (5092575 ubicación_quito, 5092576 dimensiones_mesa) VOLVIERON A ESTAR OPERATIVOS Y VINCULADOS al AI Agent.** El 24-may JC los desvinculó como parte del refactor de tools del Agent (decisión: "el LLM puede mandar el link en texto desde knowledge"). Probable motivo de re-vincularlos: el LLM no manda links bien en texto crudo (Meta puede no renderizar previews, o el LLM altera la URL larga), entonces se volvió al tool dedicado que postea con `preview_url=true` garantizado. La memoria del 24-may sobre "3 tools desvinculadas" queda parcialmente OBSOLETA — solo `tool_enviar_contrato_sb` sigue desvinculada (sigue siendo llamada internamente desde `crear_reserva_tentativa_sb`).
+- **2026-06-11 — Incidente menor de 4 min en producción: ventana de errores tras modificar scenarios activos sin test manual previo.** Entre 21:24 y 21:34 Ecuador JC modificó ambos `tool_enviar_link_*_sb` en producción. Primera modificación dejó un bug (HTTP Bad Request en POST a Meta, probable body JSON mal formado). 5 ejecuciones reales fallaron entre 21:27-21:31 antes de la segunda modificación que arregló. Tests manuales 3 min después → SUCCESS. **Aprendizaje:** modificar scenario activo en producción tiene riesgo de "ventana de error". Patrón recomendado: stop → modify → **test manual** → start. JC saltó el test manual entre primera modify y el start.
+- **2026-06-11 — Caveats Make MCP: emails de errores agrupan por scenario (no por timestamp exacto). executions_get-detail devuelve solo {name, message, causeModule}, no bundle de input.** Para diagnóstico profundo de un error puntual hay que ir a UI Make. Útil saber para próximas investigaciones rápidas: combinar `executions_list status=3` para ubicar errores + ir a UI si hace falta detalle.
+- **2026-06-10 [crítico, deuda técnica del refactor 1-jun]** — Scenarios callables `_sb` refactorizados a RPC Supabase pueden tener `\\\"\\\"` (triple escape) en `ifempty(field; \\\"\\\")` heredado del body pre-refactor. Solo se manifiesta cuando el campo opcional llega vacío del LLM → JSON parser rompe con `InvalidConfigurationError: Expected ',' or '}' at position N`. Caso confirmado: `tool_registrar_vendedor_sb` (5066871), 3 ejecuciones fallidas el 2026-06-08 22:09 UTC. Fix aplicado: reemplazar `\\\"\\\"` por keyword IML `emptystring` (sin escapes ni comillas). Validado con test E2E (campos opcionales vacíos, status=1).
+  - Por qué: la regla "usar `emptystring` para defaults" (memory 2026-05-05 y 2026-05-17) no se honró cuando el subscenario se refactorizó el 1-jun para usar la RPC `upsert_vendedor`. El refactor reescribió módulos pero arrastró el patrón viejo en los defaults.
+  - Cómo aplicar: auditar los otros `_sb` con `scenarios_get` + grep `\\\\\\\"\\\\\\\"`. Candidatos donde puede vivir el bug: `buscar_vendedor_sb`, `crear_reserva_tentativa_sb`, `consultar_reserva_sb`, `cancelar_reserva_sb`, `consultar_disponibilidad_sb`, `recuperar_sesion_sb`, `actualizar_sesion_sb`, `procesar_captura_pago_sb`, `procesar_imagen_inbound_sb`, `enviar_brochure_feria_sb` (la nueva), schedulers `_sb`. Test mínimo: invocar con TODOS los campos opcionales como string vacío y verificar `status=1`.
+- **2026-06-10 — Bug Camila reportó "feedback E2E no se guarda" — diagnóstico y fix.** Camila escribió en la etapa 2 del run E2E, navegó a la etapa 3 y vio el mismo texto. Causa raíz: dos bugs combinados. (A) "Siguiente →" y "← Anterior" eran `<Link>` (solo navegaban, no guardaban). Camila asumía que guardaban. Su feedback de etapa 2 nunca llegó a la DB — solo se guardó cuando ya estaba en etapa 3 con texto editado. (B) `<textarea defaultValue={...}>` solo aplica el valor al montar el componente. Como Next.js no remontaba el form al cambiar `?stage=`, el textarea conservaba el último valor tipeado. Por eso al volver a la etapa 2 veía el texto de la etapa 3 en pantalla (aunque en DB la etapa 2 quedó vacía). **Fix aplicado en `app/(operacion)/test-e2e/[runId]/page.tsx`:** (1) Anterior/Siguiente ahora son `<button type="submit" name="_redirect_to" value="<codigo>">`. La server action guarda y después `redirect()` a la etapa destino. (2) `key={etapaActiva.codigo}` en el `<form>` fuerza remount al cambiar `?stage=`, así React resetea los inputs. (3) Botón primario renombrado a "Guardar y quedarme aquí" para diferenciar de los nav buttons.
+  - Cómo aplicar a futuro: en cualquier flujo con varios pasos y form por paso, NUNCA usar `<Link>` para navegar entre pasos — siempre `<button type="submit">` con `name`/`value` que indique el destino. Y siempre `key={algunaIdDelPaso}` en el form para forzar remount de los inputs uncontrolled.
+- **2026-06-10 — Bug `consultar_ferias_activas_sb` (5066840) listaba ferias pasadas.** El scenario filtraba solo por `estado=in.(proxima,en_curso)`, no por `fecha`. Como el campo `estado` se actualiza manual, ferias vencidas con `estado='proxima'` aparecían como vigentes. Camila detectó: el bot listó "Quito La Carolina el 28 de mayo" el 8 de junio. Fix doble: (1) UPDATE puntual `SET estado='finalizada' WHERE fecha < current_date AND estado='proxima'` (3 ferias actualizadas). (2) Agregar `&fecha=gte.{{formatDate(now;"YYYY-MM-DD";"America/Guayaquil")}}` al GET PostgREST como defensa permanente — ahora aunque alguien olvide actualizar `estado`, las ferias pasadas no aparecen.
+  - Cómo aplicar: pendiente decidir si se agrega cron/trigger que mantenga `estado` actualizado automáticamente (cuando `fecha < today` → `finalizada`). Por ahora la doble defensa funciona.
+- **2026-06-10 — Tool `tool_enviar_brochure_feria_sb` (5343559) creada para enviar info completa de UNA feria.** Reemplaza el patrón viejo donde el bot tipeaba "fecha, dirección, horario, precio media, precio completa" en texto. Ahora el bot invoca esta tool con `feria_record_id` + `cliente_wa_number` y la tool POST WA con un mensaje rico (precios + qué incluye + ~500 visitantes + 10 años + qué se puede vender + cupos por orden de pago + perchas con medidas máximas + espacios auspiciados). Texto plano, sin emojis ni markdown. Prompt v40 → v41 con regla operativa + ejemplo concreto + PROHIBIDO ABSOLUTO de tipear el detalle.
+  - Cómo aplicar: si en el futuro Camila quiere cambiar el contenido del brochure, editar el `jsonStringBodyContent` del módulo 4 del scenario 5343559 (no tocar el prompt). Datos por feria: `nombre`, `fecha_legible_es`, `direccion`, `google_maps_url`, `horario_feria`, `precio_mesa_completa`, `precio_media_mesa`, `precio_percha_5`. Constantes hardcoded (visitantes, años, medidas mesas, medidas perchas): viven en el template, no en knowledge. Para agregar columna nueva por feria (ej. `cantidad_visitantes`), migration + actualizar template.
+- **2026-06-10 — Feature: ruta `/test-e2e` en la PWA para que Camila pruebe el sistema E2E.** 23 etapas en 5 fases (Pre-flight, Bot cliente, Handoff, PWA ops, PWA notificaciones/push). Tablas Supabase `e2e_runs` + `e2e_feedback` con RLS desde el inicio (helper `is_operadora_or_admin()`). Bucket privado `e2e-capturas` con signed URLs 1h. Resumen para JC con KPIs + tarjetas por etapa + export markdown. Banner en `/inicio` que dice "Continuar test E2E" si hay run en curso, "Iniciar test E2E" si no. Link en sidebar desktop (`(operacion)/layout.tsx`).
+  - Cómo aplicar: para procesar feedback de Camila, JC pide "procesa el run X" y Claude consulta `e2e_runs` + `e2e_feedback` por MCP Supabase. Etapas se definen en `lib/e2e/etapas.ts` — agregar/quitar no requiere migration. `ETAPAS.length` se usa dinámico en la UI para evitar números hardcoded desactualizados.
+- **2026-05-25 [CRÍTICO — invalida regla del 18/05] — `scenarios_update` del MCP de Make TRUNCA silenciosamente blueprints grandes (~165KB).** Dos incidentes en producción el mismo día al intentar editar `wa_inbound` (4820192) vía API durante la implementación del gate handoff: (1) primer intento dejó el flow con solo 4 módulos (de 9), scenario renombrado a "PLACEHOLDER_DO_NOT_USE" durante ~17 min; (2) segundo intento truncó el `systemPrompt` del Agent de 19,547 chars a 176 chars y borró el filter del módulo 24. Ambos casos el bot quedó roto respondiendo mal a clientes. Causa raíz: el blueprint completo con AI Agent + 11 tools embebidas + Knowledge supera algún límite no documentado del MCP que silenciosamente descarta partes del payload. **Nueva regla DEFINITIVA**: `wa_inbound` NUNCA se modifica vía `scenarios_update`. Siempre UI manual. Para roundtrips de scenarios pequeños (tools `_sb` aisladas, schedulers, etc.) el MCP sigue siendo seguro porque los blueprints son chicos. La regla del 18/05 que decía "tocar wa_inbound vía API es seguro" queda **OBSOLETA — no aplicar**.
+- **2026-05-25 — Make UI Revisions confirmado como mecanismo de rescate confiable.** Ambos incidentes del día se resolvieron con: scenario → menú ⋯ → "Show history" / Version history → seleccionar revisión anterior → "Restore version". Retención = 60 días. El restore mantiene el scenario activo, no requiere recargar webhook, no rompe el hook ID. Patrón nuevo de rollback para cualquier scenario que se corrompa por error humano o de API.
+- **2026-05-26 [confirmado y aplicado en producción] — INSERT directo desde Make HTTP a tablas con RLS NO funciona aunque el bearer sea la `service_role` key.** Síntoma: error 42501 "new row violates row-level security policy". Confirmado en el módulo 104 (`log_inbound_handoff`): copiar headers idénticos al módulo HTTP 103 (que sí funciona porque va a RPC) no resuelve. Algo del flujo Make termina identificando el rol como `anon` aunque pegues la service_role key. **Patrón fix reusable**: envolver el INSERT en una RPC `SECURITY DEFINER` y llamar al endpoint `/rest/v1/rpc/...` desde Make en vez del `/rest/v1/<tabla>` directo. Aplicado en `tool_log_inbound_handoff_sb` para la 3era ruta del gate handoff. Aplicar este patrón a cualquier futura tool de Make que tenga que INSERTAR en tablas del proyecto con RLS habilitada.
+- **2026-05-26 — Bug React/Next 14: `useState(searchParams.get("foo"))` causa hydration mismatch (errors #425/418/423).** El valor de `searchParams.get` puede diferir entre SSR y CSR. Si se usa como valor inicial de useState, React detecta divergencia y crashea con "Application error: a client-side exception has occurred" sin más info útil en producción. Fix: arrancar el state con `null` y leer `searchParams.get(...)` en un `useEffect(() => {...}, [])` post-mount. Aplicar a cualquier componente que necesite leer query params en el primer render.
+- **2026-05-26 — Bug Supabase Realtime: canal con nombre fijo se rompe en remounts.** Error: "cannot add `postgres_changes` callbacks for realtime:<nombre> after `subscribe()`". Pasa cuando React desmonta y vuelve a montar el componente (hidratación inicial en producción, navegación rápida, Strict Mode). El segundo mount intenta crear un canal con el mismo nombre que ya recibió `.subscribe()`. **Fix patrón reusable**: usar nombre único por mount con `` `<prefijo>-${Math.random().toString(36).slice(2)}` `` al crear el canal. Aplicar a TODOS los componentes que usan Supabase Realtime channels — afecta directamente al usuario porque rompe la página entera, no solo el componente.
+- **2026-05-26 — Bug Server Actions: faltaba `router.refresh()` en forms con `revalidatePath`.** Síntoma: el form guarda OK, los cambios se persisten en BD, pero la pantalla del cliente no refleja el cambio. Causa: `revalidatePath` en el Server Action invalida el cache del server pero el cliente no re-renderiza porque sigue con su árbol React montado. **Fix patrón reusable**: en forms client component que llaman Server Actions, después de un submit exitoso ejecutar `router.refresh()` (de `next/navigation`). Aplicado en `feria-form.tsx` con feedback visual de éxito (banner verde 3s + botón "Guardado ✓"). Patrón aplicable a cualquier form que opere sobre el mismo route que muestra los datos.
+- **2026-06-12 [CRÍTICO, decisión de producto] — Cambio de modelo del AI Agent: `gpt-4o-mini` → `gpt-4.1-mini`.** Tras 6 iteraciones inútiles del prompt + tool + description para forzar al LLM a respetar la regla 3c (confirmación previa antes de crear reserva), JC instaló `gpt-4.1-mini` en el módulo agente. Resultado inmediato: la reserva se crea de un saque, el contrato sale, la captura se procesa, el handoff funciona. Camila avanzó 6 etapas en 2h post-cambio. Costo ~3x ($22 → $60/mes a 3k conv/mes). **Cómo aplicar**: si el bot vuelve a inventar datos (perchas que no pidió, mesa de comida sin trigger), rodear prohibiciones del prompt ("inconveniente" en vez de "problema técnico"), o no pasar flags como `"true"` — primera hipótesis es el modelo, no el prompt. Hoja de ruta de alternativas baratas: `claude-haiku-4-5` (~$180/mes, mejor follower de reglas) o `gemini-2.0-flash` (~$10/mes, comparable a gpt-4o-mini pero supuestamente mejor).
+- **2026-06-12 [CRÍTICO, deuda anti-pelea-con-LLM] — `tool_crear_reserva_tentativa_sb` (5066880) refactor a 3 estados defensivos.** Pre-refactor el LLM podía: (a) pasar `feria_record_id=""` → tool devolvía `ids_invalidos` → el LLM rodeaba la prohibición con "inconveniente" → escalado falso sin invocar `notificar_humano`; (b) crear reservas con datos inventados (perchas grandes que el cliente nunca pidió) saltando la confirmación previa. Refactor en 3 capas:
+  1. **Tolerancia a UUID vacío**: inputs nuevos `feria_nombre` + `feria_fecha` (YYYY-MM-DD). URL del GET ferias condicional con IML `if(length(feria_record_id) >= 36; "id=eq."+id; "nombre=eq."+nombre+"&fecha=eq."+fecha)`. Para nombres con espacios/acentos: `replace(replace(...; " "; "%20"); "á"; "%C3%A1")`.
+  2. **Defensa server-side contra reservas inventadas**: Router con 3 ramas mutuamente excluyentes — A (proceder, feria_ok + vendedor_ok + confirmación detectada), B (`falta_confirmacion_cliente`, devuelve campos calculados `feria_resuelta`, `tipo_mesa_label`, `tiene_percha_5/10`, `tiene_mesa_comida`, `monto_calculado` para que el LLM arme su propio resumen — bug encontrado en primera iteración: la frase de ejemplo "mesa completa con percha grande por 58 USD" era literal hardcoded → el LLM la copiaba textual → fix: emitir campos dinámicos + "ARMA TU PROPIA frase, NO copies ningún ejemplo"), C (`falta_resolver_datos`, falta vendedor o feria).
+  3. **Detección de confirmación natural**: input `respuesta_cliente_ultima` (texto literal del último mensaje del cliente). Filter del Router rama A matchea contra `["confirmo", "dale", "perfecto", "listo", "claro", "si", "sí", "ok"]` vía 9 sub-arrays OR (`text:contains` + `text:equal`). Backward-compat con `confirmacion_explicita="true"`. Filter rama B es el complemento exacto con `text:doesnotcontain` y `text:notequal`.
+  - **Cómo aplicar**: cualquier tool que dependa de una decisión booleana del LLM (confirmación, escalado, etc.) debe detectarla con palabras clave en un texto que el LLM ya tiene a mano (último mensaje del cliente, output de otra tool), no con un flag que el LLM tenga que decidir. El AI Agent Beta + gpt-4o-mini no son confiables para flags. Aplicar mismo patrón a futuras tools de confirmación.
+- **2026-06-12 — Bug `/api/inbox/threads/[wa]/take`: HSM `wa_handoff_a_humano_v1` duplicaba el "Listo te pongo en contacto" del bot.** El cambio del 2026-06-12 mañana hacía que el HSM se mandara SIEMPRE al tomar. Pero el bot YA había dicho "Listo, te pongo en contacto con una persona del equipo." al invocar `notificar_humano`, así que el HSM al tomar el thread duplicaba el aviso. Camila lo reportó como UX confuso. Fix: query `conversaciones` por último `mensaje_cliente IS NOT NULL`. Si `now - last_inbound < 23h` (ventana 24h abierta) → NO mandar HSM. Si `>= 23h` o no hay → SÍ mandar (única vía de entrega). `send_template: true` fuerza, `false` saltea. Response del endpoint incluye `ventana_cerrada` para debug. **Cómo aplicar**: cuando se decide mandar un HSM "always", siempre considerar si duplica otro mensaje del flujo. La ventana 24h es buen heurístico.
+- **2026-06-12 [meta-aprendizaje, refuerzo de 2026-05-29] — Lógica determinística en la tool > pelear con el LLM.** Memory 2026-05-29 ya decía "lógica determinística en DB > pelear con el LLM". Hoy la versión actualizada: **si una regla crítica del prompt no se cumple en 2 intentos consecutivos, mueve la validación al server (tool o trigger DB).** Patrón concreto: buscar inputs que el LLM tenga al alcance "natural" (último mensaje del cliente, output de otra tool) en lugar de pedirle decidir un flag booleano. Aplicado hoy con `respuesta_cliente_ultima` en `tool_crear_reserva_tentativa_sb` después de 6 iteraciones inútiles de la `description` de la tool + bloques del prompt. **Hipótesis adicional**: el AI Agent Beta de Make probablemente lee la `description` de la tool con menos peso que el `system_prompt`. Confiar en la description para reglas críticas es frágil — el `accion_obligatoria` en el output de la tool tiene más peso porque llega como respuesta concreta del turno actual.
+- **2026-06-12 — Branding oficial reforzado: "Pulgón del Parque" (NO "El Pulgón del Parque" ni "El Pulgón" ni "Pulgón").** Aplicado al saludo del bot en prompt v43+. EXCEPCIÓN: para nombrar sedes sí se usa "El Pulgón Quito La Carolina" / "El Pulgón Cumbayá" / "El Pulgón Los Chillos" porque así se llaman las sedes. Patron de prompt: "PROHIBIDO ABSOLUTO: cambiar la marca a 'Pulgón' o 'El Pulgón' o 'las ferias de El Pulgón' cuando hablas de la organización".
+- **2026-06-12 — Prompt v42 → v48 (compresión del trayecto).** v43: branding "Pulgón del Parque". v44: 4 deltas (saludo solo primer turno + cantón vs sede + email opcional + brochure no duplicar pregunta + sección 4b para errores manejables). v45/46/47: bumps de threadId asociados a cambios de modelo y refactor de tool. v48: 4 deltas (mesa de comida puede ser media o completa + frase post-contrato con "tu pago implica la aceptación del contrato" + ejemplo OBLIGATORIO en 7b para "estoy listo / lo leí / dame los datos" + reglas anti-repetición en flujo de comida + respuesta canned "¿cómo se revisan los productos?"). Sección 4b ampliada con los 3 estados de error de la tool nueva (`falta_resolver_datos`, `falta_confirmacion_cliente`, `falta_obtener_uuids_de_otra_tool` legacy). El LLM ahora sabe que NINGUNO es escalado.
+- **2026-06-12 [bug abierto] — Fórmula `monto_total` en `tool_crear_reserva_tentativa_sb` (5066880) no suma +5 USD cuando `tipo_mesa="media"` + `tiene_mesa_comida=true`.** El IML del módulo 5 actual: `if(lower(tiene_mesa_comida) = "true"; if(contains(lower(tipo_mesa); "completa"); 5; 0); 0)`. Solo aplica +5 si la mesa es completa. Pero hoy se confirmó que mesa de comida puede ser media (ver entrada de cambios de contexto). Fix pendiente: cambiar la fórmula a `if(lower(tiene_mesa_comida) = "true"; 5; 0)`. Validar con scenarios_run y media+comida → debe dar 27+5=32 USD.
 
 ---
 
@@ -385,6 +461,11 @@ Modificaciones sobre lo que está fijado en `pulgon_contexto.md` (precios, sedes
   - Cumbayá: `Mercado Cumbayá, Av. María Angélica Idrovo y Quito 170157` (antes decía "Av. Interoceánica y Pampite" — incorrecto)
   - Los Chillos: `Calle Las Alondras OE13-55 y Av. Ilaló (junto Empresa Carlisnacks)` (antes decía "Av. Ilaló y Río Coca" — incorrecto)
   - Aplicado UPDATE en `ferias` el 2026-05-17. El bot las lee vía consultar_ferias_activas.
+- **2026-06-12** — Mesa de comida puede ser **media** o completa.
+  - Antes: mesa de comida = mesa completa + 5 USD (regla aplicada en prompt v42-v47 y en pulgon_contexto.md).
+  - Ahora: media mesa de comida (27 + 5 = **32 USD**) o mesa completa de comida (48 + 5 = **53 USD**), ambas válidas.
+  - Origen: Camila lo reportó como bug del bot en el E2E del 12-jun. JC ratificó textual: "Camila manda. Hay media mesa."
+  - Aplicado en prompt v48 (REGLA GLOBAL 2 reescrita: "el adicional es +5 USD sobre el precio de la mesa base"). Pendiente actualizar `pulgon_contexto.md` + corregir fórmula `monto_total` en `tool_crear_reserva_tentativa_sb` (5066880) que actualmente solo suma +5 cuando tipo_mesa=completa — ver entrada en "Aprendizajes y correcciones" del 2026-06-12.
 
 ---
 
@@ -420,4 +501,939 @@ Punteros a recursos fuera del repo que conviene recordar (dashboards, bases de A
 - **Meta WhatsApp Cloud** — phone_number_id: `963546683519579`. URL base: `https://graph.facebook.com/v20.0/963546683519579/messages`.
 - **Secrets** — todos en `.env` del repo (NO se duplican acá): WhatsApp Bearer, OpenAI key, Airtable PAT.
 
+---
+
+## 2026-06-13 — Sesión: quick fixes post-E2E de Camila + catálogo de sedes
+
+### Quick fixes A2 / A3 / A5 (PWA)
+- **A2 — Firma automática en respuestas libres del inbox**. `POST /api/inbox/messages/send` ahora concatena `\n\n— <Operador>, Pulgón del Parque` al texto antes de mandarlo a Graph y persistirlo en `conversaciones`. Operador derivado por mapping email→nombre (`pulgonquito@gmail.com → Camila`, `jclira@gmail.com → Juan Cristóbal`). Opt-out con `include_signature: false` o si el texto ya parece firmado (regex `[—–-]\s*Nombre$` en últimos 80 chars). Mismo mapping que usa `/take` para `{{3}}` del HSM handoff.
+- **A3 — Sugerencias "pedir docs" del inbox**. `inbox-client.tsx` función `pedirDocs()`: agregadas dos líneas al `window.prompt` → "el contrato firmado" y "el contrato firmado y el comprobante de transferencia". Default sigue siendo "tu cédula y el comprobante de transferencia".
+- **A5 — Click en notif push**. Dos bugs en cascada:
+  1. **SW (`app/sw.ts`)** — `notificationclick` hacía `clients.find(c => c.url.includes(url))` con `url="/"` → matcheaba cualquier tab y la focuseaba sin navegar. Reescrito: compara `pathname` exacto (foca y listo si coincide), o `origin` (navega `client.navigate(url)` + foca), o `openWindow()` si no hay tabs.
+  2. **`realtime-notifs.tsx`** — el `notif.onclick` hacía `window.location.href` (full-page reload, perdía estado React de la PWA). Cambiado a `router.push(n.url)` con fallback a `window.location.href` si el browser lo rechaza.
+
+### A1 — descartado por nuevo enfoque (catálogo de sedes)
+Camila reportó "no me llegó el mapa". Inicialmente diagnosticamos como gap puntual del `google_maps_url` de la feria. Verificamos: el IML del tool_enviar_brochure_feria_sb (5343559) ya hace `{{ifempty(3.google_maps_url; "se lo paso por aparte")}}`, y las 3 ferias próximas tenían `google_maps_url` poblado. El feedback de Camila era anterior al UPDATE de DB. **Conclusión**: el bug ya estaba mitigado, pero el riesgo estructural seguía — el campo podía olvidarse en una feria nueva. **Solución JC pidió**: pasar a catálogo de sedes (ver siguiente bloque).
+
+### Catálogo de sedes (decisión arquitectura)
+- **Por qué**: cada vez que se creaba una feria nueva había que llenar dirección, mapa y permite_mesa_comida a mano → riesgo de olvido o tipeo inconsistente (en DB había 6 valores distintos de `ferias.sede` para 3 sedes reales: "Mercado de Cumbayá " con espacio vs "Plaza Cumbayá", "Centro de Exposiciones Quito" vs "Parque La Carolina" para Quito, etc.).
+- **Decisión JC (2026-06-13)**: catálogo de **3 sedes** (Quito La Carolina, Cumbayá, Los Chillos). **Precios siguen por feria** (no se mueven al catálogo). Si en el futuro Quito cambia de venue puntual, se sigue creando feria nueva pero el catálogo de Quito no cambia.
+- **Migration `create_sedes_catalogo_y_trigger_herencia`** aplicada:
+  - Tabla `sedes (id uuid pk, nombre_corto text UNIQUE, direccion text, google_maps_url text, permite_mesa_comida bool)` + 3 INSERT.
+  - `ferias.sede_id uuid REFERENCES sedes(id)` (opcional, no NOT NULL para no romper rows históricos).
+  - Trigger `fn_ferias_heredar_sede` BEFORE INSERT/UPDATE: si `NEW.sede_id IS NOT NULL`, copia `direccion`, `google_maps_url`, `permite_mesa_comida` desde sedes. **Es fuente de verdad**: cambiar Cumbayá en el catálogo + un `UPDATE ferias SET sede_id=sede_id WHERE...` propaga a todas las ferias.
+  - Backfill: las 8 ferias existentes quedaron asignadas matcheando `ferias.nombre = sedes.nombre_corto`. El UPDATE final del migration normalizó los 3 campos en todas (incluida la feria histórica de 24-abr Quito que tenía `permite_mesa_comida=false` y quedó en `true`).
+  - RLS en sedes: SELECT abierto (solo lee la PWA autenticada y RPCs del bot).
+- **PWA actualizada**:
+  - `lib/schemas.ts` — `sede_id` UUID obligatorio. `sede`, `direccion`, `permite_mesa_comida` quedaron opcionales (trigger las rellena).
+  - `components/ferias/feria-form.tsx` — dropdown sede con preview de dirección + link Google Maps + flag mesa comida. Se quitaron los inputs libres `sede` y `direccion` y el checkbox `permite_mesa_comida`.
+  - `app/(operacion)/ferias/nueva/page.tsx` + `[id]/page.tsx` — fetchean `sedes` server-side y se las pasan al form.
+- **Para sede nueva (4ta locación)**: simple `INSERT INTO sedes (nombre_corto, direccion, google_maps_url, permite_mesa_comida) VALUES (...)` desde SQL. Aparece automáticamente en el dropdown de la PWA.
+
+### Aprendizajes
+- **Patrón "catálogo + trigger sobreescribe"** funciona bien cuando hay un campo derivable que la app actualmente repite a mano y el trigger normaliza al vuelo. Mantiene compat hacia atrás con todos los tools del bot que leen `ferias.direccion` o `ferias.google_maps_url` directo (no hay que tocar ningún `_sb` ni RPC).
+- **Heurística de firma del inbox**: regex `[—–-]\s*Nombre$` en últimos 80 chars evita duplicar cuando Camila ya firmó manualmente; suficiente para el 99% de casos sin pedir input adicional.
+
 <!-- Creado: 2026-04-29 -->
+
+---
+
+## 2026-06-15 — Sesión: artes globales/por feria, prompt v49, defensa bot mudo, blast v2, E2E rápido
+
+### Catálogo de Artes (separación clara global vs por-feria)
+Confusión histórica: había overlap conceptual entre "arte de reglas" (universal) y "arte de confirmación" (por feria). Quedó así de claro:
+
+| Activo | Formato | Dónde se setea | Cuándo lo manda el bot |
+|---|---|---|---|
+| `reglamento_pdf_url` (por feria) | PDF | Form feria. Default Vercel URL, reemplazable. | Con HSM de contrato al crear reserva |
+| `arte_confirmacion_url` (por feria) — etiquetado en UI como **"Afiche de esta feria"** | Imagen | Form feria. Vacío por default. | Al validar pago (msg 2 de 3) |
+| `app_settings.arte_reglas_url` (global) | Imagen | `/ajustes` → ahora ruta `/artes` en sidebar | Al validar pago (msg 3 de 3) |
+| `mapa_mesas_url` (por feria, nuevo) | Imagen | Form feria. Camila lo sube el sábado previo | Con blast de recordatorio, tras el HSM |
+
+Migrations aplicadas:
+- `add_arte_confirmacion_url_a_ferias` (junto con bucket `artes` público SELECT, INSERT auth).
+- `crear_app_settings_para_configuracion_global` con fila inicial `arte_reglas_url` vacío.
+- `add_mapa_mesas_url_a_ferias`.
+- `add_horario_desmontaje_a_ferias` con default `'15:00 - 16:00'`.
+
+Página `/ajustes` (server component) con form `AjustesForm` (client) que sube vía `UploadArteConfirmacion` y persiste con server action `guardarSetting(clave, valor)`. RLS authenticated SELECT+UPDATE en `app_settings`.
+
+**Arte de reglas universal cargado por Camila durante el run E2E** (etapa 16 = ella misma adjuntó el PNG de "5 normas esenciales" con sello "Pulgón Del Parque" como feedback). Lo migré de `e2e-capturas` al bucket `artes` en `reglas/pulgon-reglas-v1.jpg` y seteado en `app_settings.arte_reglas_url`. El bot ya manda automáticamente esa imagen al validar cualquier pago.
+
+### Hook B8/D14b — secuencia 3 mensajes al validar pago
+`marcarReservaPagada` action en `/(operacion)/reservas/actions.ts`:
+1. RPC `marcar_reserva_pagada` (igual que antes).
+2. Dispara `enviarConfirmacionPagoAlCliente(reservaId)` en background (catch silencioso, no rompe la validación si falla).
+3. Manda 3 mensajes vía Graph API: texto personalizado ("Listo {nombre}, tu reserva para {feria} ({fecha}) está confirmada. Te esperamos en {dirección}.") + imagen `feria.arte_confirmacion_url` (skip si vacío) + imagen `app_settings.arte_reglas_url` (skip si vacío).
+4. Cada envío se persiste en `conversaciones` con `enviado_por='camila'` (queda visible en inbox). Audit log final `confirmacion_pago_enviada` con flags `tuvo_arte_feria` / `tuvo_arte_reglas`.
+
+### Prompt v49 — pegado por JC, threadId bumpeado a _v49
+Tres deltas sobre v48:
+- **REGLA GLOBAL 3 — NO ofrecer add-ons**: percha y mesa de comida solo si el cliente las menciona. Al RESUMIR no listar componentes en 0. Cuando piden "dame costos" lista solo media y completa (no agrega comida).
+- **Mensaje post-reserva (sección 5)**: incluye "Tienes 6 horas para confirmar el pago, pasado ese plazo la reserva se libera automáticamente." (y variante Los Chillos con la advertencia de la cancha sintética).
+- **Sección Descuentos nueva**: Camila no ofrece por iniciativa. Solo en accidente/cambio. Siempre sobre TOTAL. Si Camila ya ofreció monto en el thread, respetarlo TAL CUAL sin recalcular. Si el cliente menciona descuento sin que Camila lo haya ofrecido → `notificar_humano` con motivo `'consulta descuento'`.
+
+### Defensa contra bot mudo en wa_inbound (4820192)
+Bug detectado: el módulo 5 (HTTP a Graph API) tenía `body:"{{30.text}}"` directo. Si el LLM devuelve string vacío, Graph rechaza con `text.body is required`. Camila había topado con este error en run del 13-jun.
+
+Fix aplicado por JC en UI Make (Claude le dio instructivo y validó tras el save):
+```
+body:"{{ifempty(30.text; "Disculpa, dame un momento. Te respondo enseguida.")}}"
+```
+
+Verificado: tras el save (15-jun 19:47 UTC), 4 ejecuciones nuevas con status:1 (success), cero errores. Prompt v49 cubre la regla por arriba, pero esto es defensa server-side de Make — independiente del LLM.
+
+**Pendiente opcional**: agregar router antes del módulo 5 que, cuando `30.text` esté vacío, dispare `notificar_humano` para enterar a Camila del incidente. Documentado pero no aplicado (JC pidió cambio mínimo).
+
+### Fix knowledge file `pulgon_faq.md` (mesa de comida)
+Líneas 34 y 197 decían "5 USD adicionales sobre **mesa completa**". Corregido a "5 USD sobre la mesa base elegida — aplica tanto a media (27+5=32) como a completa (48+5=53)". JC re-subió el knowledge al AI Agent de Make UI.
+
+Causa raíz del bug que vio Camila en E2E: aunque el prompt v48 y el tool 5066880 ya estaban OK con la regla nueva, el LLM le hacía caso al knowledge file que aún decía la regla vieja. Ese era el último lugar contaminado. Ahora 100% propagado.
+
+### Quick fixes 17b / 20 (notificaciones)
+- **17b — Invitar feria** (`/api/vendedores/[id]/invitar-feria` + `enviarBienvenida` action):
+  - {{2}} ahora pasa `${feria.nombre} - ${feria.fecha_legible_es}` (antes solo nombre, por eso Camila vio "no menciona fecha").
+  - Idempotencia 6h: query a `audit_log` con `contains("detalles", { feria_id })` + filtro de últimas 6h. Si ya existe, devuelve `ya_enviado_recientemente` sin reenviar (resuelve el "envía dos veces" por doble click en mobile).
+  - Guard cliente: `pending` check en `handleEnviar()` antes de `confirm()`.
+- **20 — Trigger DB `tg_notificar_mensaje_inbound`** ahora notifica también re-engagement: si el último inbound previo del thread fue hace >=4h, crea notif `mensaje_inbound` (título sufijo `(re-engagement)`) aunque el handoff esté inactivo. Antes solo notificaba si era thread nuevo o handoff activo, por eso el "hola" frío de Camila no subía el badge. Botón "Marcar todas como leídas" ya existía en `/notificaciones`.
+
+### Blast recordatorio v2 (preparado para feria)
+- **HSM `wa_recordatorio_feria_v2` aprobado por Meta** con 7 variables y botones quick reply "Confirmado" / "Tengo una consulta".
+- Endpoint `/api/ferias/[id]/blast-recordatorio` reescrito:
+  - Nombre template → `wa_recordatorio_feria_v2`.
+  - Variables: nombre, feria con prefijo "El Pulgón " (helper `nombreFeriaConMarca`), fecha legible, horario feria, montaje, desmontaje (helper `normalizarRango` cambia `-` por `a`), URL Google Maps.
+  - **Adjunto automático**: después del HSM, si la feria tiene `mapa_mesas_url`, manda imagen con caption `"Mapa de mesas — {feria}"`. Tolerante a fallo: si el mapa falla, no aborta el blast (el HSM ya salió).
+  - Audit log con flag `mapa_adjunto`.
+- UI `BlastRecordatorioButton` actualizado: dry-run muestra ejemplo completo del nuevo copy + indicador verde "se adjunta el mapa" si está cargado, o ámbar "Esta feria no tiene mapa de mesas cargado" si no.
+
+### Simplificación módulo /test-e2e (A + C)
+- **Botón "✓ Sin novedad, siguiente"** (verde, arriba a la derecha de cada etapa, excepto Pre-flight): marca etapa como OK conservando comentario/capturas previos, avanza a la siguiente. Server action `marcarOkYSiguiente`.
+- **Botón "✓ Marcar pendientes como OK y cerrar run"** en el resumen (solo si `estado='en_curso'`): marca como OK únicamente las etapas en pendiente (no toca observaciones/bloqueante), cierra el run. Server action `cerrarRunMarcandoPendientesOk` con `upsert` bulk.
+- Camila ahora puede recorrer el E2E rápido: 1 click verde por etapa si todo OK; solo se detiene a llenar formulario cuando hay algo que reportar.
+
+### Banner refresh app + botón Actualizar
+Para que Camila no quede con cache vieja del SW post-deploy:
+- `components/shared/update-banner.tsx` montado en layout(operacion): detecta `registration.waiting`, muestra banner fixed bottom-right con botón "Actualizar". Auto-update check cada 60 min en background.
+- `components/shared/update-app-button.tsx` con `RefreshCw` + estados (buscando / actualizado / sin-cambios / error). Vive en `/perfil` bajo "Actualizar app".
+- SW (`app/sw.ts`): listener `message` con `type: 'SKIP_WAITING'` para que `waiting.postMessage` tome efecto inmediato.
+
+### Sidebar reorganizado
+La entrada `/ajustes` (mi cambio) creaba duplicado con la entrada original "Ajustes" que apunta a `/perfil`. Solución:
+- `/ajustes` ahora se etiqueta **"Artes"** en sidebar con ícono `ImageIcon` (sigue siendo path `/ajustes` por dentro — no migré para evitar redirects rotos).
+- Botón "Actualizar app" se movió a `/perfil` (la "Ajustes" original con tema visual + cuenta + logout).
+
+### Otros
+- **Fix `crearFeria` tolerante a sede_id vacío**: si la PWA cachea versión vieja (sin dropdown), `actions.ts` resuelve por `ferias.nombre` matcheando contra `sedes.nombre_corto`. Evita el `Server Components render error` que vio Camila al crear feria con build cacheada.
+- **Etiqueta "Arte de confirmación" → "Afiche de esta feria"** en el form de feria (campo de DB sigue siendo `arte_confirmacion_url`, solo cambió label).
+- **MapaMesas widget** en feria-form usando mismo `UploadArteConfirmacion` (label "Mapa de mesas (se envía con el recordatorio)").
+
+### Aprendizajes
+- **Knowledge file pisa todo**: aunque cambies el prompt y el tool con la regla nueva, si el knowledge file dice lo viejo, el LLM le hace caso. Es la fuente más sticky. Cuando se cambia una regla de negocio, revisar TRES lugares en orden: (1) DB/tool de cálculo, (2) prompt, (3) knowledge files. El último es el más fácil de olvidar.
+- **Idempotencia barata server-side** = `audit_log` query con `gte("ts", haceXh)` + `contains("detalles", { ...id })`. Funciona sin tabla aparte y aprovecha el log que ya existe. Patrón replicable para cualquier acción crítica con riesgo de doble click.
+- **Tools de scenario MCP de Make** no permiten roundtrip de blueprints muy grandes (>50K tokens) via `scenarios_update`. Para wa_inbound (162KB) hay que hacer cambios mínimos vía UI directamente. La regla "API roundtrip safe" del 18/05 sigue aplicando para blueprints chicos pero no para los grandes con AI Agent.
+- **Default "pendiente" engorroso en E2E**: cambiar a "implícito OK por avance" sería más natural. JC eligió híbrido (botón explícito) para mantener disciplina de evaluación.
+
+### Pendientes que quedan abiertos
+- C12 sync contactos WA Business — JC importó 921 contactos vía VCF + SQL. Ver sección "Imports de datos" más abajo. Bot ya los puede contactar.
+- A4 botón notificar_humano en wa_inbound cuando bot mudo — mejora opcional, no aplicada.
+- 08 (re-entry pagar) y 14b (app cuelga al marcar) — Camila confirmó 14b solventado; 08 a reverificar en próximo run.
+
+<!-- Cerrado: 2026-06-15 -->
+
+---
+
+## 2026-06-16 — Sesión: fix runs E2E, cron ferias, blast OCR, run nuevo de Camila, bug transitorio Inbox
+
+### Cron auto-finalizar ferias pasadas
+- Camila reportó que las ferias del 14-jun seguían como `proxima` en el home. Causa: sin proceso automático que mueva el estado cuando la fecha pasa.
+- **Migration `auto_finalizar_ferias_pasadas`** aplicada:
+  - `CREATE EXTENSION pg_cron` (Supabase la permite).
+  - Función `fn_auto_finalizar_ferias_pasadas()` que mueve a `finalizada` cualquier feria `proxima`/`en_curso` con `fecha < (now() AT TIME ZONE 'America/Guayaquil')::date`.
+  - Cron `auto_finalizar_ferias_pasadas` schedule `0 2 * * *` (02:00 UTC = 21:00 hora Quito, después del cierre operativo).
+  - UPDATE inicial limpió las 2 ferias del 14-jun mal marcadas.
+- **Para forzar manual**: `SELECT public.fn_auto_finalizar_ferias_pasadas();`.
+
+### Reset Cami Lira para E2E limpio
+- Borrados de Cami Lira (vendedor `ea680c97-...`, wa `593984652033`): 1 vendedor + 391 conversaciones + 3 reservas + 1 sesión + 1 handoff + 36 audit_log + notificaciones asociadas (FK por `reserva_id` también).
+- Cuando Camila escribe al bot ahora entra como cliente nuevo y arranca registro desde cero.
+
+### Bug crear feria: `ferias.sede` NOT NULL
+- Con el catálogo de sedes el form ya no manda `sede` (texto libre). Pero `ferias.sede` quedó NOT NULL sin default desde antes → INSERT fallaba con 500 (23502 NOT NULL violation).
+- **Fix**: actualizar `fn_ferias_heredar_sede()` para que el trigger también copie `sede = sedes.nombre_corto` además de dirección/maps/comida. Migration `trigger_heredar_sede_tambien_copia_sede_texto` + re-disparado del trigger en las 8 ferias existentes para normalizar el campo `sede`.
+
+### Fix JSON inválido en tools de OCR captura pago
+- 3 scenarios fallando en cascada con `Bad escaped character in JSON at position 256`:
+  - `wa_inbound` (4820192) → llamaba a
+  - `tool_procesar_imagen_inbound_sb` (5069434) → llamaba a
+  - `tool_procesar_captura_pago_sb` (5069377) ← bug raíz.
+- Causa: el OCR del LLM (gpt-4o-mini Vision) extrae beneficiario/referencia y los inyecta crudo en `jsonStringBodyContent` de varios módulos HTTP. Si el OCR devuelve comilla, backslash o newline (más probable con los 921 contactos VCF importados que tienen nombres raros), el body queda con JSON inválido.
+- **Fix aplicado vía API** (sub-agente roundtrip) al scenario 5069377: módulos 8, 9, 11 y 12 envueltos con `replace(replace(CAMPO; "\""; emptystring); newline; " ")` sobre `5.beneficiario`, `5.referencia`, `7.vendedor.nombre`, `7.referencia`, `7.feria.nombre`. Los otros 2 scenarios dejaron de fallar en cascada (eran cascade errors del child).
+
+### Fix autocomplete Android en módulo E2E (Camila vio textareas con texto del run anterior)
+- Bug UX: en una etapa nueva del E2E, los textareas `respuesta_bot` y `comentario` aparecían **pre-rellenados** con texto del run del 12-jun (incluyendo branding viejo "El Pulgón" antes del rename "Pulgón del Parque"). Causa: autofill del browser Android usa los `name` del campo para sugerir valores recientes; cache del SW (NetworkFirst) sirviendo HTML viejo no ayuda.
+- **Fix 1**: `autoComplete="off"` + `autoCorrect="off"` + `spellCheck={false}` + `data-form-type="other"` (no alcanzó solo).
+- **Fix 2 definitivo**: nuevo client component `FeedbackTextarea` en `app/(operacion)/test-e2e/[runId]/feedback-textarea.tsx`. En `useEffect` con dependencia `etapaCodigo`, si el server pasa `defaultValue=""` pero el DOM trae algo (autofill o cache), limpia el `el.value`. Se respeta valor de DB si hay feedback guardado. `key={etapaActiva.codigo}` ya forzaba remount.
+
+### Bug Inbox: regresión "no captura toda la conversación" (transitoria)
+- En el run de Camila del 15-jun de noche: durante el handoff humano, los mensajes del cliente NO se guardaban en `conversaciones`. Resultado: composer Inbox decía "Pasaron más de 24h" aunque el cliente acababa de escribir, y el historial quedaba mancado (solo outbound).
+- Causa raíz: la lógica del scenario `wa_inbound` separa el flujo en routes. Cuando handoff activo, route 4 (módulo 104) debe invocar la RPC `tool_log_inbound_handoff_sb` que inserta el inbound con `enviado_por='cliente'` y `estado='humano_atendiendo'`. Esa RPC existe y está bien escrita (verificada con `pg_get_functiondef`), pero el módulo 104 fallaba silenciosamente durante el run del 15-jun (probable token vencido / RPC timeout transitorio).
+- **Intento de fix invasivo abortado**: empecé a agregar un módulo HTTP nuevo que insertaba `mensaje_cliente` antes del filter de handoff. Save anyway desactivó el scenario por `BlueprintValidationError`. JC revirtió y, al reactivar el scenario hoy 16-jun, el módulo 104 vuelve a funcionar. **Aprendizaje**: el bug original NO era estructural. Antes de tocar wa_inbound, validar si la regresión es transitoria.
+- **Defensa adicional aplicada en PWA** (`lib/inbox/queries.ts`): si `ultimo_inbound_ts` viene null pero el handoff humano está activo Y `humano_desde` es <24h, asumir ventana abierta. Eso evita que el composer se rompa si la RPC vuelve a fallar transitorio.
+- Verificado con test: 3 filas en DB del thread `593998301965` (bot respondió "Test" → Camila tomó → JC mandó "hola hola" durante handoff y se guardó con `enviado_por='cliente'`).
+
+### Run E2E de Camila — 15-jun noche (finalizado anoche 22:39 hora Quito)
+Reutilizó el run viejo "Run 4 de junio" (id `bc19e6eb-...`). **26/26 etapas marcadas: 16 ok / 9 obs / 1 bloqueante**. Mejor que el del 12-jun (era 6/15/3). La mayoría de fixes del 15-jun aterrizaron correctamente.
+
+**Pendientes identificados en este run (priorizado):**
+- 🔴 **P0 — Composer Inbox no aparece + bot manda 4 mensajes en cascada al tomar handoff** (etapa 11 bloqueante). Ver bloque de bug transitorio arriba; ya resuelto al reactivar scenario.
+- 🟠 **P1 — Fechas un día antes**: el bot dice "Quito La Carolina 5 de julio" cuando la feria es el 4 de julio. Bug de timezone — `fecha_legible_es` se genera o se renderiza en UTC en vez de America/Guayaquil. Afecta etapas 16, 17b. Pendiente auditar todos los lugares donde se compone fecha legible.
+- 🟠 **P1 — Doble mensaje al validar pago** (etapa 16): el bot manda "Listo Cami, tu reserva está confirmada…" + "Hola Cami Lira, confirmado: recibimos…". El primero es el hook B8 (`marcarReservaPagada` → `enviarConfirmacionPagoAlCliente`). El segundo lo dispara el bot wa_inbound al detectar el cambio de estado vía sesión. Hay que desactivar uno; voto eliminar el segundo (el primero es más natural y trae artes).
+- 🟠 **P1 — Doble reserva si el cliente se sale del guion** (etapa 05): cliente da datos, bot crea reserva, cliente agrega "quiero llevar percha", bot crea SEGUNDA reserva sin cancelar la primera. Vi en DB las dos: `RES-260615-213556624-2033 $37 pagado` + `RES-260615-212933847-2033 $27 pendiente`. Fix: en `tool_crear_reserva_tentativa_sb`, antes de crear, buscar tentativa activa del mismo vendedor+feria y cancelarla.
+- 🟡 **P2 — "WhatsApp 1-click" del detalle de vendedor abre el WA Business propio de Camila**, no el chat con el bot. Camila quiere que abra `wa.me/593968249754?text=...` (número del bot) para que la conversación quede registrada y el bot conozca el thread.
+- 🟡 **P2 — Firma como "Equipo Pulgón" en lugar de "Camila"** (etapa 13). `nombreOperador()` del `/send` solo conoce `pulgonquito@gmail.com` y `jclira@gmail.com`. Verificar qué email tiene Camila en su perfil PWA.
+- 🟡 **P2 — La referencia técnica `RES-260615-213556624-2033`** aparece en el mensaje del bot al cliente y confunde. Sacar del copy (queda en DB para auditoría, pero no se muestra).
+- 🟡 **P3 — Saludo (etapa 02) corta "¿en qué te puedo ayudar?"** cuando hay perfil WA con nombre. Pequeño delta del prompt v50.
+- 🟡 **P3 — 03 consulta_ferias redundante**: el LLM aún manda 2ª línea al final del brochure tipo "Te acabo de enviar info, ¿quieres avanzar?". Reforzar v49→v50.
+- 🟡 **P3 — 09 caso_comida: bot salta de Quito a Chillos** sin que el cliente lo pida. Tracking de sede pierde el hilo a la mitad del flujo.
+- 🟡 **P3 — 17 puesto A10 raro**: NO es bug — es auto-asignación de mesa (`marcar_reserva_pagada` asigna puesto). Solo aclarar a Camila.
+
+### Aprendizajes
+- **Antes de tocar estructura de un scenario en producción, validar si el bug es transitorio**. Hoy gasté ~2h con JC haciendo cambios invasivos al wa_inbound para un bug que se resolvió solo al reactivar el scenario. Aprendizaje futuro: la primera vez que se reporta una "regresión" en un sistema que antes funcionaba, **primero re-test sin tocar nada** (apagar/encender, esperar, escribir test). Si el bug persiste en condiciones limpias, ahí sí ir a diagnóstico estructural.
+- **El `save anyway` de Make UI puede desactivar el scenario** si la validación IML falla silenciosamente. NO es safe en producción. Si Make marca "Invalid IML" después de pegar texto literal con `{{N.campo}}`, arrastrar las variables desde el panel lateral en lugar de "Save anyway".
+- **El patrón `replace(replace(X; "\""; emptystring); newline; " ")`** funciona como sanitización defensiva universal para texto LLM/OCR antes de inyectarlo a `jsonStringBodyContent` de Make. Repetir este pattern en TODO endpoint que reciba texto de origen externo.
+- **El módulo de Test E2E hereda autofill cross-runs** porque los `name` de inputs HTML son globales. Para textareas sensibles al contexto del run, el patrón es: client component + `useEffect` con `etapaCodigo` que limpie el DOM si la fuente de verdad (DB) está vacía.
+
+<!-- Cerrado: 2026-06-16 -->
+
+---
+
+## 2026-06-16 (tarde) — Sesión: P4 audit completo E2E, prompt v51, templates HSM pendientes
+
+Continuación del análisis del run E2E del 15-jun. JC pidió revisar TODOS los textos+capturas de Camila para detectar items pasados por alto. Surgieron 8 puntos adicionales (P4): 4 quedaron resueltos hoy, 4 dependen de input de Camila o reaprobación Meta.
+
+### Hooks B8 reforzados (sesión post-pago)
+- **Puesto asignado en el texto de confirmación**: `actions.ts > marcarReservaPagada` ahora pasa `puesto_asignado` (devuelto por la RPC) al helper `enviarConfirmacionPagoAlCliente`. Texto incluye línea `🪧 Tu puesto: A10` cuando hay puesto. Camila lo va a echar de menos si no está.
+- **Reglamento PDF como 4ª pieza**: si la feria tiene `ferias.reglamento_pdf_url` cargado, se envía como `document` con `filename="Reglamento Pulgon del Parque <nombre>.pdf"` al final de la cascada (texto → arte feria → arte reglas → reglamento). Pedido explícito de Camila en E2E etapa 16.
+- `audit_log.evento='confirmacion_pago_enviada'` ahora registra `puesto`, `tuvo_reglamento_pdf` además de los flags previos.
+
+### Invitar a feria: preselección automática
+- Camila en E2E 17b: *"No se elige automatico. Las ferias salen con las fechas un dia antes."* (timezone ya cubierto el 15-jun).
+- `components/vendedores/invitar-feria.tsx`: estado inicial del select arranca con `ferias[0]?.id` (las trae el page ordenadas por fecha ascendente → próxima activa). Al reabrir el panel sin selección, repobla. Quita un click de fricción.
+
+### Trigger DB filtra saludos de notif global
+- Camila E2E 20: *"Activa abajo en inbox, no arriba en notificaciones por un saludo. Esta perfecto solo esta mal armado el prompt."*
+- Nueva función `_es_saludo_simple(text) RETURNS boolean` (IMMUTABLE): detecta saludos cortos (≤30 chars) tipo "hola/holaa/buenas/hi/buenos días/hey/saludos" tolerando emojis vía `regexp_replace` que elimina chars no-ASCII antes de matchear.
+- Migration `trigger_notificar_inbound_filtrar_saludos_v2_emojis` redefine `tg_notificar_mensaje_inbound`:
+  - Si `NEW.mensaje_cliente` es saludo → `RETURN NEW` sin insertar notif.
+  - El conteo de "primer mensaje histórico" ahora ignora mensajes-saludo previos. Así, cuando el cliente mande la **segunda** frase con contenido real, ese cuenta como primer mensaje y dispara `cliente_nuevo` con campanita roja.
+- **Por qué importa para el futuro**: el patrón `_es_saludo_simple` puede reutilizarse en cualquier filtro server-side que necesite distinguir "el cliente solo está abriendo conversación" vs "el cliente está pidiendo algo concreto".
+
+### Prompt v51 (D6 + D7, integrados en secciones existentes — NO apilados al final)
+JC me corrigió: los deltas no van como bloque separado al final, se integran en las secciones temáticas. Pegados así:
+- **D6** dentro de `# REGLA GLOBAL 3 — NO OFREZCAS ADD-ONS POR INICIATIVA`, último bullet: "si el cliente agrega/cambia UN dato (percha, comida, fecha), NUNCA reinicies el flujo ni repreguntes datos que ya tenés; reconfirmá SOLO lo que cambió y recalculá el monto en UNA sola frase de SI/NO". Cubre etapa 05 "Me salgo de guion y se cuelga y me vuelve a preguntar todo".
+- **D7** dentro de `## 5. Después de crear_reserva_tentativa exitosa`, entre PROHIBIDOS y EXCEPCIÓN Los Chillos: "el aviso 'léelo con calma, tienes 6 horas, cuando estés listo avísame' se manda UNA SOLA VEZ; si el cliente vuelve a escribir cualquier cosa NO reanudes con esa frase ni con versiones reformuladas". Cubre etapa 06 "Mensaje de revisar contrato para avanzar reiterativo".
+- **Patrón a respetar a futuro**: cuando agregue cambios al prompt, integrarlos en secciones temáticas correctas, no apilar al final. Si el prompt se vuelve inmanejable consolidar en versión nueva reorganizada por secciones.
+
+### Templates HSM pendientes de reaprobación Meta
+JC mandó un texto a Camila explicándole por qué hace falta reaprobar y los dos copies nuevos. Pendiente que ella suba a Meta Business Manager y avise template_name aprobado.
+- **`wa_handoff_a_humano_v2`** (UTILITY, reemplaza v1). Motivo Camila E2E 11: *"se vuelve reiterativo dice que me va a pasar... debe decir que ya le estoy atendiendo yo, no que me va a pasar otra vez"*. Body: `"{{1}}, {{3}} ya está aquí para ayudarte con {{2}}. Te responde por este mismo chat."` Footer: `El Pulgón`. Sin botones.
+- **`wa_invitacion_feria_v1`** (MARKETING — Camila aceptó el costo ~3 ctvs/envío, lo usa poco). Motivo Camila E2E 17b: *"Creo que el Template no esta cumpliendo su proposito. No se entiende mucho lo que dice. Quizas... aunqie nos mande a marketing que si invite a la proxima feria"*. Header text `El Pulgón te invita`. Body: `"Hola {{1}}, te invitamos a participar como expositor en {{2}}, el {{3}}. Quedan cupos disponibles y nos encantaría tenerte. ¿Te paso los detalles?"` Footer: `El Pulgón del Parque`. Quick reply: "Sí, cuéntame" / "Ahora no".
+- **Pendiente cuando aprueben**: reemplazar `wa_handoff_a_humano_v1` por `_v2` en `app/api/inbox/threads/[wa]/take/route.ts` (línea ~131). Para `wa_invitacion_feria_v1`: hoy `InvitarFeria > enviarBienvenida` invoca el HSM `wa_bienvenida_v1`; cambiar a `wa_invitacion_feria_v1` con vars `{nombre, feria, fecha_legible}` cuando el nuevo esté activo.
+
+### Commit autor — gotcha de Vercel
+- El commit `45ba5ab` quedó bloqueado por Vercel (estado "Blocked" en Deployments). Causa: protección "Git Author Verification" — el commit tenía autor `Claude <jclira@gmail.com>` porque lo hice desde el sandbox con `git -c user.name="Claude" -c user.email="jclira@gmail.com" commit`. El sandbox NO tiene la config local de JC.
+- **Fix**: JC corrió `git commit --amend --reset-author --no-edit && git push --force-with-lease origin main` para reescribir el autor con su `user.name`/`user.email` real. Vercel desbloqueó y deployó.
+- **Aprendizaje para futuras sesiones**: cuando haga commit desde sandbox, NO pasar `-c user.email`. Mejor que JC lo amende localmente con su config, o yo uso un email genérico tipo `noreply` que igual lo va a bloquear Vercel. La opción **menos fricción**: hacer el commit con el SHA correcto desde sandbox y pedirle a JC `git commit --amend --reset-author --no-edit` antes del push.
+
+### Aprendizajes
+- **Auditar feedback completo (texto + capturas) detecta más que el primer análisis.** El primer pase del run 15-jun cerró con ~10 items. El segundo pase (a pedido de JC) sumó 8 más. Patrón a aplicar: cuando un E2E tenga comentarios largos en una sola etapa, releerlos despacio porque suelen tener varios sub-items concatenados (caso etapa 17b tenía 4 problemas distintos en un solo comentario).
+- **Los deltas del prompt no van al final del prompt sino integrados en secciones temáticas.** Si me dejo llevar por el patrón "delta apilado", el prompt se vuelve sobreescritura de reglas duplicadas. JC ya integra los deltas a mano en la sección correcta.
+- **Vercel "Git Author Verification"** bloquea commits cuyo autor no coincide con un colaborador verificado del proyecto. El sandbox queda fuera de eso por definición. La forma correcta es que el commit final tenga el autor de JC vía `--reset-author`.
+
+<!-- Cerrado: 2026-06-16 (tarde) -->
+
+---
+
+## 2026-06-16 (noche) — Setup de auth Git/GitHub permanente
+
+Cerramos el problema recurrente de que los commits que yo (Claude) hacía desde el sandbox quedaban bloqueados en Vercel por autor incorrecto, y de que el push fallaba por credenciales viejas.
+
+### Email correcto de JC para commits
+- **Email primario verificado en GitHub**: `jotacelira@gmail.com`. NO `jclira@gmail.com` (este último NO está en su cuenta de GitHub — por eso Vercel "Git Author Verification" bloqueaba).
+- **Email noreply de GitHub**: `223918779+JeyCee510@users.noreply.github.com` (privado, GitHub lo acepta como autor verificado).
+- **Convención aplicada**: cuando haga commits desde sandbox, usar `git -c user.name="Juan Cristobal Lira" -c user.email="223918779+JeyCee510@users.noreply.github.com"`. Vercel acepta el autor y no bloquea el deploy.
+- En el repo local del Mac quedó configurado el mismo autor con `git config user.name/user.email`, así también cualquier `--reset-author` que tenga que correr JC localmente da el resultado correcto.
+
+### Limpieza del entorno de auth en el Mac de JC
+JC tenía tres problemas acumulados que rompían el push:
+1. **`gh` CLI con token inválido en keyring** (`Failed to log in... The token in keyring is invalid`). Como `gh auth git-credential` estaba registrado como credential.helper de `https://github.com`, git mandaba un token vencido y GitHub lo rechazaba antes de pedir credenciales nuevas.
+2. **`.git/config` local del repo PWA tenía `credential.helper = store`** apuntando a `~/.git-credentials` (archivo plano con un PAT viejo).
+3. **`~/.gitconfig` global tenía `helper = ` vacío** que reseteaba la cadena para `https://github.com` y dejaba al de `gh` como único activo.
+
+**Fix aplicado:**
+```
+git config --unset-all credential.helper    # quitó el "store" del repo
+rm ~/.git-credentials                       # borró el archivo de PAT viejo
+gh auth login -h github.com                  # re-autenticó gh por web browser → guardó token nuevo en keychain
+```
+Después de eso, `gh auth status` reporta `Logged in as JeyCee510` y `git push origin main` sube sin pedir credenciales.
+
+### Setup actual (estado bueno conocido)
+- **Push lo hace JC en su Mac.** El sandbox NO tiene credenciales de GitHub (ni las debería tener: el riesgo de mantener un PAT persistente en el mount no compensa). Yo dejo el commit local con autor correcto, JC corre `git push origin main`.
+- **Credential helper activo**: `gh auth git-credential` (gestionado por GitHub CLI). El osxkeychain queda como fallback global pero no se usa para github.com.
+- **Si vuelve a fallar el push con "Invalid token"**: lo más probable es que el token de `gh` haya vencido. Solución es `gh auth login -h github.com`. NO toquetear gitconfig ni keychain manualmente — gh maneja todo.
+
+### Aprendizajes futuros
+- **El "noreply" de GitHub es la forma canónica de proteger el email privado en commits públicos**. Antes de hacer cualquier commit en un repo donde el push esté protegido por Vercel/branch rules, verificar que el email del autor esté en `github.com/settings/emails`.
+- **`gh` CLI y git credential.helper interactúan invisible pero fuertemente.** Cuando `gh auth login` corre por primera vez, agrega `helper = !gh auth git-credential` a `~/.gitconfig` para `https://github.com`. Esto vence el osxkeychain por orden. Si `gh` deja de funcionar (token vencido, reinstalación, downgrade), git deja de poder pushear aunque el keychain esté lleno de tokens válidos.
+- **Cuando un commit lo hago desde el sandbox y va a ser pusheado a un repo con Vercel, configurar autor con `-c user.email=<noreply>`**. El email `jclira@gmail.com` que usé varias veces antes de hoy NO es válido — el del noreply es el bueno.
+
+<!-- Cerrado: 2026-06-16 (noche) -->
+
+---
+
+## 2026-06-22 — Sesión: setup auth Git permanente, deploy P4 + v51, fixes wa_inbound de auditoría DB
+
+Fecha real: 22-jun (memory.md previo tenía 16-jun, fueron sesiones distintas separadas).
+
+### Inicio: revisión warning Make + auditoría de `conversaciones`
+A Camila se le acabaron los créditos de Make ayer/anteayer; los recargaron hoy. Llegó un warning: `Response can't be processed when scenario is not executed immediately on data arrival.` — comportamiento esperado cuando el webhook queda en cola y se procesa diferido (el `gateway:WebhookRespond` ya no puede contestar a Meta porque el HTTP cerró). No es bug: es consecuencia del corte.
+
+Al revisar la única conversación del corte (thread `593983557220`, 22-jun 16:29 UTC), descubrimos un patrón crónico: el thread tiene 4 mensajes históricos (26-may, 2-jun, 3-jun, 22-jun) todos con `mensaje_cliente=""` y `wamid_outbound=null`. JC inicialmente pensó que era bug del inbox para clientes no registrados, pero auditoría DB amplia mostró:
+- 300 filas no-registrado con `mensaje_cliente` con texto vs 11 vacías + 74 NULL → no es bloqueo por vendedor_id null. Es intermitente.
+- **TODOS** los 303 envíos `enviado_por='bot'` tienen `wamid_outbound=null` (las filas de PWA `camila` y `sistema` sí lo guardan).
+
+### Fix #1 aplicado a wa_inbound — `wa_text` con button/list reply fallback
+Módulo 3 (SetVariables "Solo mensajes reales"), variable `wa_text`. Antes:
+```
+{{1.entry[].changes[].value.messages[].text.body}}
+```
+Después:
+```
+{{ifempty(1.entry[].changes[].value.messages[].text.body;
+   ifempty(1.entry[].changes[].value.messages[].interactive.button_reply.title;
+   ifempty(1.entry[].changes[].value.messages[].interactive.list_reply.title;
+   1.entry[].changes[].value.messages[].button.text)))}}
+```
+Causa raíz: cuando el cliente apretaba quick reply de un HSM (button_reply), Meta no manda `text.body`, manda `interactive.button_reply.title`. El scenario perdía el contenido del mensaje, el AI Agent respondía genérico, y el `mensaje_cliente` quedaba vacío en DB. Esto explica el patrón del thread 593983557220 y los 85 inbound vacíos del rango.
+
+Validado: enviado "hola" → `mensaje_cliente="hola"` ✓ (path texto plano no se rompió).
+
+### Fix #2 aplicado a wa_inbound — `wamid_outbound` se persiste cuando el bot manda texto
+Módulo 6 (HTTP POST a `/rest/v1/conversaciones`). Sumamos campo nuevo al `jsonStringBodyContent`:
+```
+,"wamid_outbound":"{{ifempty(5.data.messages[1].id; emptystring)}}"
+```
+El módulo del sendText real es el **5** (URL parametrizada `graph.facebook.com/v20.0/{{3.wa_phone_number_id}}/messages`), NO el módulo 29 (ese era `status:read + typing_indicator`). `Parse response` del módulo 5 estaba prendido de antemano.
+
+Validado: enviado "hola" → `wamid_outbound="wamid.HBgMNTkzOTk4MzAxOTY1..."` (62 chars) ✓.
+
+### Aprendizajes operativos clave (no repetir errores)
+- **Cuando `parseResponse=true` en un HTTP module de Make, el body parseado vive bajo `.data`, no en la raíz**. Path correcto: `{{N.data.messages[1].id}}`. La primera versión `{{N.messages[1].id}}` (que tipeé sin saber del prefijo `data`) hizo que la pill resolviera a vacío y se guardara `""` en DB sin error visible. Recién al ver el bundle de salida (módulo inspector → "Show output") quedó claro el shape real.
+- **Distinguir los HTTP a Graph API por su body**: en `wa_inbound` hay TRES módulos a `graph.facebook.com/.../messages`. El que importa para el wamid es el del sendText con `{"messaging_product":"whatsapp","to":..., "type":"text", "text":{...}}`. Los otros mandan `status:read` (mark-as-read) o `typing_indicator` — esos también devuelven 200 con `success:true` pero NO traen `messages[].id` con el wamid del bot. Mirar el body de envío antes de mappear.
+- **Si una pill puede resolver a vacío y el JSON del body lo necesita "envuelto en quotes", siempre envolver con `ifempty(X; emptystring)`**. La primera versión del Fix #2 (sin ifempty) rompió todo el scenario: cuando el módulo 5 no se ejecutaba (el flow entró por rama distinta del router), Make insertó un texto raro en lugar del wamid → JSON inválido en position 389 → scenario stopped. La defensa con `ifempty(...; emptystring)` garantiza `""` válido para JSON aun cuando la rama del módulo origen no corrió.
+- **Antes de empezar a editar un scenario crítico en Make UI, exportar el Blueprint como JSON desde los `…` del scenario** (Export Blueprint). Si el cambio rompe, se reimporta en segundos. NO confiar en el undo de Make UI — no llega lejos.
+- **`gateway:WebhookRespond` no puede contestar al webhook caller si la ejecución es diferida** (ej. créditos agotados → cola → corren cuando se recargan). Eso genera warnings tipo "Response can't be processed when scenario is not executed immediately on data arrival" y queda como ejecución WARNING. El AI Agent y los HTTP siguientes SÍ corren — la única pérdida es el 200 OK a Meta, que entonces puede reintentar el webhook. Para prevenir: activar alertas de "Low operations remaining" en Make Organization → Notifications.
+- **Filtros con duplicados de nombre de variable en SetVariables están permitidos en blueprints viejos pero rechazados al guardar en UI actual** ("This field contains duplicate values for 'name': X"). Hoy nos pasó con `wa_msg_type` declarado dos veces. Borrar uno, son idénticos.
+
+### Estado al cierre
+- Scenario `wa_inbound` activo y andando con los dos fixes.
+- Fila de prueba (`thread_id='593998301965'`, ts 18:54 UTC) confirma ambos campos OK.
+- Filas históricas viejas con `mensaje_cliente=""` o `wamid_outbound=null` se quedan así — no las vamos a backfill, es solo deuda histórica.
+- Deuda pendiente para la partición del wa_inbound (ya conversada): el patrón de extraer ramas en sub-scenarios callables sigue siendo el plan, esta sesión solo fue parche puntual.
+
+<!-- Cerrado: 2026-06-22 -->
+
+---
+
+## 2026-06-29 — Handoff: estado actual + bug abierto en wa_inbound (módulo 37)
+
+Entrada de transición — JC va a pasar el proyecto de Opus 4.7 a 4.8. Esta entrada describe estado del sistema y el bug pendiente con suficiente detalle para que la próxima sesión arranque sin re-diagnóstico.
+
+### Estado del sistema (todo lo que funciona y dónde vive)
+
+- **PWA** (Next.js 14 App Router) en Vercel, deploy automático desde `main` del repo `pulgon-pwa`. PWA con Service Worker (Serwist), push notifs, inbox real, formularios de feria/vendedor/reserva, módulo Test E2E, hooks B8 con confirmación de pago.
+- **Supabase** project `jzvnnowaytphtdwzufnh`: source of truth. Triggers + RPC SECURITY DEFINER. pg_cron diario 02:00 UTC para `auto_finalizar_ferias_pasadas`. RLS por `profiles.role` (operadora/admin).
+- **Make.com** orgID 7374867, team 2183478, scenarios `_sb` callables + `wa_inbound` (4820192) + `wa_outbound` + `pwa_acciones_camila` (5086803). Beta AI Agent con gpt-4.1-mini (recientemente subido desde 4o-mini, ver param `defaultModel` en módulo 4).
+- **WhatsApp Cloud API directo** (sin BSP). Phone number id `963546683519579`. Bearer token + phone id en env de Vercel y como hardcoded en algunos módulos Make (deuda).
+- **HSM templates aprobados Meta (al cierre de 2026-06-16 noche)**: `wa_handoff_a_humano_v2`, `wa_invitacion_feria_v1`, `wa_envio_contrato_v1`, `wa_solicitud_documentacion_v1`, `wa_confirmacion_reserva_v1`, `wa_recordatorio_pago_v1`, `wa_pago_recibido_v1`, `wa_escalamiento_humano_v1`, `wa_recordatorio_feria_v2`, `wa_handoff_a_bot_v1`, `wa_reserva_expirada_v1`, `migracio_canal` (sí, typo aprobado por Meta). El handoff_v1 y el wa_bienvenida_v1 son obsoletos en el código (referencias solo en JSDoc histórico).
+- **Prompt vigente: v51** (D6 anti-reinicio en sección REGLA GLOBAL 3, D7 anti-repetición "léelo con calma" en sección 5). Sin deltas pendientes.
+- **Fixes wa_inbound aplicados el 22-jun** (ver entrada 22-jun más arriba): #1 wa_text con button/list reply en módulo 3, #2 wamid_outbound con ifempty en módulo 6.
+
+### Bug abierto crítico — módulo 37 lee `wa_text` PRE-transcripción
+
+**Síntoma:** thread `593983557220` (cliente recurrente, vendedor no registrado, perfil de WhatsApp sin nombre) tiene 5 registros (26-may, 2-jun, 3-jun, 22-jun, 29-jun) todos con `mensaje_cliente=""` aunque el bot generó respuestas variadas (saludo, listado de ferias, "dime qué necesitas"). JC reportó hoy "no lo veo en el inbox".
+
+**Causa raíz identificada:**
+- Módulo 3 SetVariables (con Fix #1) → `wa_text` toma de `text.body` o `interactive.button_reply.title` o `interactive.list_reply.title` o `button.text`. Cubre texto y botones.
+- Subscenario 33 (procesar_audio/imagen_inbound_sb) transcribe audio o procesa imagen, devuelve `texto_transcrito`.
+- Módulo 34 SetVariables redefine `wa_text` con `if(33.texto_transcrito = "_no_audio_"; 3.wa_text; 33.texto_transcrito)`. Acá vive la versión final con transcripción.
+- AI Agent (módulo 4) lee `{{34.wa_text}}` — por eso responde correctamente a audio/imagen.
+- **Módulo 37 (regexp:Replace que alimenta el INSERT en `conversaciones`) lee `{{3.wa_text}}` — NO el 34**. Por eso para audio/imagen guarda `""`. Para texto y button reply sí guarda porque ya está en el 3.
+
+**Hipótesis del cliente 593983557220:** está mandando audios o imágenes (notas de voz o fotos). Confirmar con Cami pidiéndole que mire el thread en WA Business y diga qué tipo manda.
+
+**Fix propuesto (1 edit en Make UI, bajo riesgo):**
+- Abrir scenario `wa_inbound` (id 4820192) → módulo 37 (regexp:Replace, está justo antes del módulo 6 que es el HTTP insert a `/rest/v1/conversaciones`).
+- Cambiar el campo `text` del mapper de `{{3.wa_text}}` → `{{34.wa_text}}`.
+- Save. Antes Export Blueprint.
+- Validar enviando audio corto al bot desde un número de prueba; verificar en DB que `mensaje_cliente` tenga la transcripción.
+
+**Por qué no se aplicó hoy 29-jun:** JC pidió hacer el handoff a 4.8 antes de tocar Make UI otra vez. La próxima sesión debe ejecutar este fix.
+
+### Requerimiento adicional de JC (mismo día)
+
+> "necesito que en el inbox registre todo entrante y saliente."
+
+El fix del módulo 37 cubre la mayor parte. Pero hay un caso que queda fuera: stickers, locations, contactos, video, document — para estos, el subscenario 33 no transcribe (devuelve `_no_audio_`) y `3.wa_text` también está vacío, así que `34.wa_text` queda vacío y el insert sigue guardando `""`. Para esos casos, propuesta más completa (no urgente):
+
+1. Agregar `wa_msg_type` al body del módulo 6 (insert conversaciones). Hay que correr migration para sumar columna `wa_msg_type text` a la tabla `conversaciones`.
+2. En `lib/inbox/queries.ts > obtenerThread`, cambiar el filter `if (c.mensaje_cliente)` a algo más permisivo: si `mensaje_cliente` está vacío pero hay `wa_msg_type` distinto de `text`, mostrar un placeholder tipo `[imagen]`, `[audio]`, `[sticker]`, `[ubicación]`, `[contacto]`, `[video]`, `[documento]`. Para tener el media_id descargable haría falta también persistir `wa_media_id` en `conversaciones`.
+
+Esto es una mejora más amplia. La próxima sesión decide si JC lo quiere ahora junto con el fix mínimo o en una iteración posterior.
+
+### Cosas que la nueva sesión NO debe re-hacer
+
+- No re-diagnosticar Fix #1 ni Fix #2 — ya están en prod y andando (validados con `mensaje_cliente="hola"` y `wamid_outbound` de 62 chars). Las filas históricas con campos vacíos NO se backfill.
+- No tocar el setup de auth Git — está resuelto (ver entrada 2026-06-16 noche). Commits con `Juan Cristobal Lira <223918779+JeyCee510@users.noreply.github.com>`, push lo hace JC en su Mac.
+- No re-explicar arquitectura — está documentada en CLAUDE.md + pulgon_contexto.md + ARQUITECTURA.md.
+- No proponer reescribir el wa_inbound desde cero. El plan acordado es "extraer ramas en sub-scenarios callables, una por sesión, empezando por audio". Ese es trabajo futuro, no inmediato.
+
+### Convenciones de trabajo con JC (recordatorio)
+
+- Español tuteo neutro, sin voseo, sin emojis, respuestas escuetas.
+- Antes de actuar: leer contexto, clarificar, mostrar plan breve.
+- Nunca borrar archivos sin autorización.
+- Nunca modificar archivos `.md` sin aprobación (memory.md es excepción para apendizar al cierre de sesión).
+- Tocar Make UI con MUCHA cautela: nunca "Save anyway", arrastrar variables del panel lateral en vez de tipear `{{X.campo}}`, exportar Blueprint antes de editar wa_inbound.
+- Para los HTTP modules de Make con `parseResponse=true`, el path al body parseado es `{{N.data.X}}`, no `{{N.X}}`.
+
+<!-- Cerrado: 2026-06-29 (handoff a Opus 4.8) -->
+
+---
+
+## 2026-07-01 — Fix módulo 37 wa_inbound aplicado y validado (audio/imagen al inbox)
+
+Primera sesión en Opus 4.8. Se ejecutó el fix pendiente del handoff 29-jun.
+
+### Fix aplicado (el pendiente del handoff)
+- **Módulo 37** (`regexp:Replace` que sanitiza comillas/saltos antes del INSERT a `conversaciones`, módulo 6): campo `text` cambiado de `{{3.wa_text}}` → `{{34.wa_text}}`. El regexp (`pattern ["\n\r\t]`, value espacio) se mantuvo intacto.
+- **Quién lo aplicó**: JC en Make UI, arrastrando la pill `34.wa_text` del panel (no tipeada a mano). Se confirmó por captura antes de guardar.
+- **Confirmación del blueprint** (vía MCP scenarios_get): en TODO el blueprint había exactamente 1 ocurrencia de `{{3.wa_text}}` (el módulo 37) y 2 de `{{34.wa_text}}` (AI Agent módulo 4 + RPC del insert alterno línea ~3942). Post-fix: 0 y 3. Cadena: módulo 37 → salida `37.text` → módulo 6 body `"mensaje_cliente":"{{37.text}}"`.
+- **Validación E2E**: JC mandó una NOTA DE VOZ real al bot → fila 2026-07-01 23:34 UTC (thread `593998301965`) con `mensaje_cliente="Hola, ¿qué ferias tienes disponibles?"` (transcripción Whisper, antes habría quedado `""`). Fix validado para audio. (Texto y botones ya funcionaban por Fix #1 del 22-jun vía módulo 3, que alimenta el módulo 34.)
+
+### Por qué NO apliqué el fix vía MCP (aprendizaje)
+- `scenarios_update` reemplaza el **blueprint completo** (~160 KB), no acepta patch de un solo campo. Reenviar 160 KB re-serializados por la API es en la práctica MÁS propenso a corromper que arrastrar 1 variable en la UI. Para un cambio de 1 campo en scenario de prod, la UI (arrastrar pill) es la vía más segura.
+
+### Thread 593983557220 (no registrado) — diagnóstico y recuperación
+- Confirmado que ese cliente manda **audios/imágenes**: sus filas quedaban con `mensaje_cliente=""` incluso DESPUÉS del Fix #1 (que ya captura texto+botones en módulo 3) → el input llegaba solo por la vía de transcripción (módulo 34), que el módulo 37 no leía. La evidencia estuvo 100% en Supabase, no hizo falta preguntar a Camila.
+- Estado del thread en DB: 6 filas (26-may, 2-jun, 3-jun, 22-jun, 29-jun, 30-jun), TODAS `enviado_por='bot'`. Cada fila = un turno (guarda `mensaje_cliente` + `respuesta_bot` juntos). El lado del BOT está guardado; el lado del CLIENTE está vacío en las 6. El media original tampoco se guardó (`media_tipo`/`media_url` null en inbound). **Contenido histórico del cliente NO recuperable desde Supabase.**
+- **No backfill** de filas históricas (política ya acordada). El thread recién aparecerá en el inbox cuando el cliente mande un mensaje nuevo (el inbox filtra por `mensaje_cliente` no vacío en `lib/inbox/queries.ts > obtenerThread`).
+- Recuperación desde historial de ejecuciones Make: retención llega solo hasta **22-jun**, así que 26-may/2-jun/3-jun/22-jun purgadas. Solo 29-jun (exec `b50ff373ca8c472c9f7de0c8f6e70ed1`) y 30-jun (`e23b5a4292124c268ace5e4627c4fb4a`) siguen. **Aprendizaje**: el MCP `executions_get-detail` solo devuelve `{status:SUCCESS}`, NO el bundle con la transcripción. Para leer el contenido de una ejecución hay que abrir el inspector en Make UI (History → módulo 34/AI Agent → bundle de entrada). JC optó por NO recuperarlas (ambas respuestas del bot en esos días fueron el fallback genérico "dime qué necesitas" → el audio probablemente llegó vacío/poco claro).
+
+### Hueco residual pendiente (NO abordado esta sesión, por decisión de JC)
+El fix del módulo 37 cubre texto, botón, audio e imagen. **Siguen guardando `""`**: stickers, ubicación, contacto, video, documento (para esos, subscenario 33 devuelve `_no_audio_` y `3.wa_text` vacío → `34.wa_text` vacío). Mejora amplia si se quiere cerrar del todo: columna `wa_msg_type` (+ opcional `wa_media_id`) en `conversaciones`, sumarla al body del módulo 6, y placeholder `[audio]/[imagen]/[sticker]/...` en `queries.ts` cuando `mensaje_cliente` vacío pero hay tipo.
+
+<!-- Cerrado: 2026-07-01 -->
+
+---
+
+## 2026-07-15 — Limpieza E2E + fix IML módulo 8 de tool_procesar_captura_pago_sb
+
+> Nota de fechas: el reloj de la DB/entorno mostró fechas inconsistentes dentro de la misma tanda de trabajo (la entrada "2026-07-01" de arriba y esta "2026-07-15" son sesiones muy cercanas; los timestamps de ejecución de hoy son 2026-07-15). No re-fechar la entrada previa: sus timestamps coinciden con lo que la DB reportaba entonces.
+
+### Limpieza del número de Camila para E2E nuevo
+- Se limpió `593984652033` para arrancar E2E fresco. **Patrón establecido**: NO borrar el vendedor, archivarlo renombrando `whatsapp` → `593984652033_pre_e2e_<YYYYMMDD>` (hoy quedó `_pre_e2e_20260713`; ya había uno `_pre_e2e_20260601`). Archivar solo el vendedor NO alcanza: `conversaciones` y `sesiones` se indexan por `thread_id` (número crudo), hay que borrarlas también o el bot ve la sesión vieja.
+- Qué se borró (todo eran artefactos del E2E de junio, ferias ya pasadas): 18 conversaciones, 1 sesión, 3 reservas, 24 notificaciones, 1 handoff; se liberó el puesto A10 (Los Chillos). Vendedor archivado.
+- **Respaldo completo antes de borrar**: esquema `e2e_backup`, tablas `bk20260713_*` (vendedores, conversaciones, sesiones, reservas, notificaciones, handoffs, puestos). Restaurable con `INSERT INTO public.X SELECT * FROM e2e_backup.bk20260713_X`. Conteos verificados idénticos antes de borrar.
+- Se dejaron intactos a propósito: la captura de pago en Storage (`593984652033_20260615214603.jpg`, ya sin reserva) y `processed_wamids` (dedup por wamid, no bloquean mensajes nuevos).
+
+### Bug crítico: IML inválido en módulo 8 de `tool_procesar_captura_pago_sb` (5069377)
+- **Síntoma**: al mandar captura de pago (imagen), el bot no respondía y la reserva no avanzaba. En History de `wa_inbound`, ejecución con error `RuntimeError (CallSubscenario) → BlueprintValidationError: Cannot initialize the scenario - 1 problem found`.
+- **Cadena de llamadas**: `wa_inbound` módulo 24 → `tool_procesar_imagen_inbound_sb` (5069434) → su módulo 10 llama a `tool_procesar_captura_pago_sb` (5069377) → **este no inicializaba**.
+- **Causa raíz**: el módulo 8 (HTTP PATCH a `reservas`) tenía IML inválido en `captura_referencia`. Usaba comillas escapadas estilo JSON `\"` DENTRO del `{{ }}`: `replace(replace(5.referencia; \"\\\"\"; emptystring); newline; \" \")`. **IML NO acepta `\"`** — usa comillas rectas planas. El `lastEdit` de 5069377 es 16-jun 22:57, o sea el edit que introdujo esto fue DESPUÉS del E2E de junio que sí procesó captura bien (por eso "funcionaba antes"). No tuvo NADA que ver con el fix del módulo 37.
+- **Fix aplicado** (JC en UI, campo "Body content" del módulo 8, pegó string limpio): `captura_referencia` pasó a `{{ifempty(5.referencia; emptystring)}}` — sin el `replace` de comillas (la referencia ya viene limpia del ParseJSON módulo 5) y sin comillas internas que rompan el IML. `estado_pago` y `captura_monto` sin cambio.
+- **Aprendizaje IML clave**: dentro de `{{ }}` en un body jsonString, NUNCA meter `\"` (escape estilo JSON) ni comillas internas si se puede evitar. Para defaults usar `emptystring` en vez de `\"n/a\"`. Confirmado con la skill `.make-skills/make-module-configuring/iml-expressions.md` (sección Common Errors: usar comillas rectas, no escapar). Los módulos 9 y 12 tenían el mismo patrón pero Make no los marcó (posible que reporte solo el primero); JC confirmó que tras arreglar el 8 no quedó nada en rojo.
+- **Por qué NO se hizo por MCP**: `scenarios_update` reemplaza el blueprint completo, y estos subscenarios tienen las llaves de API (OpenAI, Supabase service_role, WhatsApp) hardcodeadas en los headers. Reenviar 8 KB con secretos reproducidos a mano es más riesgoso que pegar 1 body sin secretos en la UI. **Regla**: para fixes de 1 campo en subscenarios con secretos hardcodeados, editar en UI el campo (que no contiene secretos), no round-trip por MCP.
+- **Validación end-to-end en prod** (2026-07-15): JC corrió el flujo completo desde su número (593998301965). Ejecución de 5069377 a las 14:17:20 → status SUCCESS, 11 operaciones (antes: 0 ops, BlueprintValidationError). Reserva `RES-260715-091627219-1965` quedó `estado_pago=captura_recibida`, `captura_monto=25.00`, `captura_referencia=150762020900`. Bot respondió "Recibí tu captura. El equipo está validando..." a las 14:17:26 y quedó en `conversaciones`. Cadena completa OK: descarga imagen → extracción OpenAI → PATCH reserva → aviso operador → confirmación cliente.
+
+### Deuda pendiente conversada (NO resuelta, para próximas sesiones)
+- **Turnos con tool-call no llegan al inbox**: de ~14 turnos reales del E2E de hoy, solo se guardaron 2 en `conversaciones` (los "Hola" sin tool). Cuando el AI Agent ejecuta una tool, el flujo va por otra rama del router (`wa_inbound` router 21, ruta 1 = CallSubscenario 24) que NO pasa por el módulo 6 (INSERT). Es problema **arquitectónico y viejo** (el E2E de junio guardó 0 filas de bot con texto). El fix del módulo 37 NO lo causó ni lo agrava. Es la causa real de "el inbox no anota todo el intercambio".
+- **JC reportó "varias fallas" en el flujo del E2E de hoy** (a revisar con calma): lógica de reserva nueva vs expirada, el flujo corriendo sobre su propio número, respuestas vacías puntuales (ej. 19:54 del 13-jul). Pendiente diagnóstico.
+- **Seguridad**: llaves de API (OpenAI `sk-proj-...`, Supabase service_role JWT, WhatsApp bearer) hardcodeadas en headers de varios subscenarios. Deuda ya conocida; conviene rotarlas y moverlas a variables/connections en algún momento.
+
+### Frente 1 CERRADO — el inbox registra TODO entrante (constraint + RPC + Paso 1 del split)
+
+JC listó 4 problemas del E2E. Priorizamos el **Frente 1** ("el inbox no registra entrantes de números no registrados; hay que registrar todo entrante y saliente sin importar registro"). Causas encontradas y resueltas:
+
+**a) Bug del constraint (era EL grueso del F1).** `notificaciones_tipo_check` NO permitía `tipo='cliente_nuevo'`, pero el trigger `tg_notificar_mensaje_inbound` lo emite en el **primer mensaje real de un cliente nuevo**. Como es AFTER INSERT, al fallar el trigger se **revertía el INSERT en `conversaciones`** → el entrante del cliente nuevo no se guardaba. Los saludos sí (el trigger los ignora vía `_es_saludo_simple`). Por eso threads viejos previos a esa versión del trigger (ej. `593963422026`) sí guardaron. Migration `fix_notificaciones_tipo_check_add_cliente_nuevo` (agregó `cliente_nuevo`). Validado en vivo: mensaje de cliente nuevo ahora guarda + crea la notif.
+
+**b) RPC unificada `tool_log_inbound_sb`.** Inserta 1 fila `enviado_por='cliente'`, `estado='recibido'` por cada entrante. Usa el texto/transcripción o, si viene vacío, placeholder por `wa_msg_type` (`[imagen]`, `[audio]`, `[sticker]`, `[video]`, `[documento]`, `[ubicación]`, `[contacto]`, `[mensaje]`). Dedup defensivo por `wa_msg_id`+`enviado_por='cliente'`.
+
+**c) Paso 1 del split del `wa_inbound`** (ejecutado por JC en UI, guiado clic por clic, con respaldo previo):
+- **Módulo 104** (era rama 2 "Humano atendiendo"): URL repunteada a `tool_log_inbound_sb`, body +`"p_wa_msg_type":"{{3.wa_msg_type}}"`, y **filtro removido** (label → "Log inbound (siempre)") → corre para TODO mensaje, sin importar tipo/registro/handoff. Es el logger universal del entrante.
+- **Módulo 6** (insert a `/conversaciones`): se le quitó `mensaje_cliente` del body → queda solo saliente (`respuesta_bot`). Evita el duplicado.
+- **Error handler**: se agregó **Skip** (módulo 110) al módulo 104 → logging best-effort; si la RPC falla, descarta el bundle y el flujo sigue (no tumba el webhook).
+- Router ahora: rama 0 (texto→AI Agent + módulo 6), rama 1 (imagen→procesar_imagen), rama 2 (log inbound siempre).
+
+**Modelo nuevo de `conversaciones`** (unificado): cada entrante = fila `enviado_por='cliente'` (`mensaje_cliente`, `estado='recibido'`); cada saliente del bot = fila `enviado_por='bot'` (`respuesta_bot`, `mensaje_cliente` NULL). El PWA (`obtenerThread`) ya lo renderiza bien (splitea por fila); `handoff-summary` y la urgencia (que buscaban `enviado_por='cliente'`, antes inexistente en rama 0) MEJORAN. Validado en vivo: texto → 1 fila `cliente` + 1 `bot` sin duplicado; imagen → 1 fila `cliente` `[imagen]`.
+
+**Gotcha importante de la edición:** al agregar `p_wa_msg_type` en el body del 104 se perdió una **comilla de cierre** (`"{{34.wa_text}},` en vez de `"{{34.wa_text}}",`) → JSON inválido → módulo 104 fallaba (Bad Request) → como tenía `stopOnHttpError=true` y `maxErrors=3`, **Make auto-desactivó el scenario**. Aprendizajes: (1) editar bodies JSON con pills es propenso a perder comillas — verificar con `scenarios_get` tras editar; (2) un módulo que falla puede auto-desactivar el scenario entero; por eso le pusimos el Skip; (3) el "error de las 09h04 en tool_procesar_captura_pago" que llegó por mail fue MI test de inicialización con `media_id` inválido, no un bug.
+
+**Número de JC de-registrado para pruebas:** `593998301965` archivado como `593998301965_pre_e2e_20260715`; backup completo en `e2e_backup.bk20260715_jc_*`. **JC pidió NO restaurarlo** (lo deja archivado para seguir probando como no-registrado). Nota: aunque esté no-registrado, el inbox muestra "Juan Cristóbal Lira" porque es el `wa_profile_name` (nombre público de WhatsApp que Meta manda con cada mensaje) + badge "NO REGISTRADO"; no es una registración residual.
+
+**Respaldo del blueprint pre-split:** `.backups_make/backup_4820192_wa_inbound_pre_split_2026-07-15.json` (versión post-fix-módulo-37, confirmada).
+
+### Pendientes al cierre de hoy (para próximas sesiones)
+
+- **Paso 2 del split — COMPLETADO 2026-07-15 (noche).** Se extrajo la rama 0 (AI Agent + plumbing) al subscenario callable `wa_responder_bot_sb` (id **5671936**), y el `wa_inbound` router rama 0 pasó a un solo `CallSubscenario`. Detalles en la guía `SPLIT_wa_responder_bot_sb.md` (raíz del proyecto): esqueleto por MCP, agente + 12 tools re-agregadas a mano (el copy/paste NO trae las tools), plumbing copiado (IDs nuevos 105→16, 30→17, 5→18, 37→19, 6→20; agente 4→3), refs externas reconectadas a `{{1.x}}`. Probado aislado (Run once, 7 tools OK) y en vivo tras swap (entrante+saliente logueados, respuesta correcta). **SWAP reversible:** la rama 0 vieja quedó DORMIDA (filtro cambiado a `{{3.wa_msg_type}}` Equal to `__OFF__`, nunca pasa) como fallback — PENDIENTE borrarla tras confirmar estabilidad. **Gotcha del swap:** un subscenario callable debe estar **toggled ON (activo)** para que `CallSubscenario` lo invoque; recién creado por MCP quedó OFF → primer mensaje falló con `RuntimeError: Scenario is not activated`. Se prende el toggle y anda. **Reglas de ejecución confirmadas:** (a) `wa_inbound` NO se edita seguro por MCP (blueprint 160 KB con secretos); UI guiado con capturas + respaldo. (b) el AI Agent tiene prompt v51 (39K) + 12 tools (`SCN_` refs) inline en su `tools[]`; el copy/paste de Make preserva prompt+connection+modelo pero NO las tools → re-agregarlas una por una. (c) 6 tools mapean un input a `{{wa_from}}` (buscar/registrar/crear_reserva/notificar_humano/recuperar_sesion/actualizar_sesion + brochure con cliente_wa_number); el resto los provee el agente ("Let AI Agent decide"). Respaldo pre-swap: `.backups_make/backup_4820192_wa_inbound_post_paso1_2026-07-15.json`.
+- **BUG a investigar — `tool_crear_reserva_tentativa_sb` (5066880) FK duro:** en test live (16-jul 00:10) falló con `Conflict 23503 / vendedor_id=7ecb03d2-...-64d6f24af161 not present in vendedores` (FK `reservas_vendedor_id_fkey`). El agente pasó `vendedor_id=7ecb03d2-7b20-4a23-9b47-64d6f24af161`, un id **FANTASMA** (verificado: NO existe en `vendedores` ni activo ni archivado, ni en backups). Mientras tanto el número `593998301965` tiene un vendedor ACTIVO real (`7e0fb9e5-07cd-4222-87ea-126ce11bb0ed`) — el agente re-registró a JC durante el test. O sea `buscar_vendedor` devuelve `7e0fb9e5` pero el agente pasó `7ecb03d2` a `crear_reserva`: **el agente NO usó el output fresco de la tool, usó un id viejo/fantasma de su memoria de conversación** (thread `593998301965_v51`). El error se repitió incluso cuando JC pidió ANULAR por audio (el agente quedó atascado reintentando crear con el id malo). Como es error DURO (Conflict 23503, no `falta_confirmacion`/`falta_resolver_datos`), el agente escaló a humano. **FIX DE FONDO APLICADO Y VALIDADO (2026-07-16):** en `tool_crear_reserva_tentativa_sb` (5066880) se agregó el **módulo 12 "Verificador vendedor"** (clon del módulo 10 "Resolver feria_id", conserva auth Supabase) intercalado `10 → 12 → Router`, con URL `/rest/v1/vendedores?select=id&id=eq.{{ifempty(1.vendedor_record_id;"0000...")}}&limit=1`. Y en los 3 filtros del router se cambió el chequeo del vendedor de `length(1.vendedor_record_id)` (formato del id) a `length(12.data[1].id)` (existe de verdad): rutas "OK+confirmación" y "Falta confirmación" ahora requieren `≥36` del lookup, y "Falta vendedor o feria" usa `<36` del lookup. Validado con Run once (id fantasma + confirmación=true → antes status 3 Conflict FK; ahora status 1, 2 ops, devuelve `falta_resolver_datos` sin insertar ni crashear). Root cause era: los filtros validaban FORMATO del UUID (36 chars) pero no EXISTENCIA, así que un id fantasma con formato válido pasaba al insert y reventaba el FK. Fix inmediato alternativo (no usado): resetear thread del agente `_v51`→`_v52`. NOTA: el "Cumbayá 7-jun" que apareció en el motivo del escalado NO es Frente 2 (no fue un listado fresco de ferias) — fue memoria vieja del thread; JC lo corrigió.
+- **Frente 2 — bot ofrece ferias pasadas:** bug real e **intermitente** (a veces ofrece finalizadas: "Los Chillos 28-jun", "La Carolina 5-jul", "14 de junio"; otras veces bien: Cumbayá 19-jul/CEQ 26-jul/Chillos 26-jul). Revisar filtro fecha/estado en `tool_consultar_ferias_activas_sb` o si el AI Agent responde de memoria sin llamar la tool. Ferias `proxima` en DB al 15-jul: MERCADO DE CUMBAYA 19-jul, Chillos 26-jul, CEQ 26-jul (el resto `finalizada`). También naming inconsistente ("Los Chillos" vs "Chillos", "Quito La Carolina" vs "CEQ").
+- **Frente 3 — prompt v52 CREADO (2026-07-16), PENDIENTE desplegar.** Archivo `promptPULGON_v52.txt` (copia de `promptPULGON15jul.txt` = v51, con 5 fixes quirúrgicos). Fixes: (1) **percha pedida ignorada+cobrada en silencio** (bug nuevo): sección 3d ahora prohíbe asumir tamaño de percha y cubre "percha pedida junto con la mesa" — explica+pregunta tamaño en el mismo turno, no pasa cantidad_percha a la tool hasta confirmar; (2) sección 3c(ii): si el cliente mencionó percha/comida, tratarla (sin ofrecerla si no la mencionó); (3) **doble "léelo con calma"**: el agente ya no repite lo que el HSM del contrato dice, solo agrega plazo 6h + pago=aceptación (actualizado Ejemplo OK, regla anti-repetición y excepción Los Chillos); (4) tono "solo dos opciones de mesa" solo para opción inválida, si no "¿prefieres media o completa?" plano; (5) prohibido decir "ya tengo tu marca/email" y no mencionar "marca" a quien no tiene. **Deploy:** pegar el v52 en Instructions del AI Agent de `wa_responder_bot_sb` (módulo 3, ya NO en wa_inbound por el split) + bumpear Thread ID `{{1.wa_from}}_v51` → `_v52` (esto además resetea threads viejos → soluciona el id fantasma de vendedor del testing).
+- **Menor:** la respuesta del bot a **imágenes** (ramas de `procesar_imagen`/`procesar_captura_pago`) no se loguea como fila saliente en `conversaciones` (el entrante-imagen sí, como `[imagen]`). Si se quiere el saliente también, agregar el insert en esas ramas.
+
+### Cierre de sesión 2026-07-16 (madrugada)
+Sesión récord. Cerrado y validado en prod: fix módulo 8 (capturas), Frente 1 completo, **split completo (Paso 1 + Paso 2)** — `wa_inbound` ahora despachador delgado que llama a `wa_responder_bot_sb` (5671936), fix FK de `crear_reserva_tentativa` (módulo 12 Verificador vendedor). Prompt **v52 listo** (`promptPULGON_v52.txt`, 5 fixes de Frente 3 + limpio de voseo, incluida la limpieza de los voseos pre-existentes del original) — PENDIENTE desplegar. Creado **`HANDOFF.md`** (snapshot completo del sistema para retomar/pasar el proyecto: arquitectura post-split, estado, pendientes, gotchas, respaldos). Pendientes: desplegar v52 (+ bump threadId `_v52`), borrar rama 0 vieja dormida del wa_inbound, Frente 2 (ferias pasadas), rotar secretos.
+
+<!-- Cerrado: 2026-07-16 (Frentes 1 y split completos; v52 listo sin desplegar; F2 y limpieza pendientes) -->
+
+---
+
+## 2026-07-16 (tarde/noche) — E2E v2 completo, wipe de actividad, prompt v53, coherencia de las 3 capas, home PWA
+
+Sesión con Claude (Cowork). Todo verificado por MCP contra Make/Supabase/Vercel en vivo.
+
+### Test E2E v2 — diseñado, implementado y desplegado
+- **PLAN_E2E_V2.md** (raíz) aprobado por JC. Decisiones: usuarios ambos (Camila+JC), limpieza automática solo rol admin con backup + whitelist.
+- **DB**: migraciones `e2e_v2_schema` (e2e_runs: modo smoke/full, preparado_at, backup_schema; e2e_feedback: checks jsonb, checks_estado, checks_at; tabla `e2e_numeros_test` whitelist con RLS — seed: 593998301965 JC, 593984652033 Camila).
+- **RPC `e2e_preparar_run`** (pre-flight 1 botón): guards admin+whitelist, backup a `e2e_backup.bk<fecha>_run<id>_*` con conteos verificados ANTES de borrar, archiva vendedor `_pre_e2e_<fecha>`, cancela reservas vivas + libera puestos, limpia conversaciones/sesiones/handoffs/notifs. Testeada: guard whitelist rechaza números no marcados; happy path con número sintético OK. Hallazgo: también limpia las notifs que generan los triggers (la reserva sintética disparó 7).
+- **RPC `e2e_verificar_etapa`**: checks SQL server-side por etapa (CASE por código, sin SQL desde cliente), ventana >= preparado_at, estados pass/parcial/fail/sin_checks. Gotcha plpgsql: no admite PROCEDURE anidada en DECLARE → helper externo `e2e_check_item`.
+- **Catálogo v2**: 29 etapas alineadas a v52/v53 (corrigió etapas 05/06/07 que contradecían el prompt), modos smoke (~9 etapas, 15 min) / full, cobertura nueva: audio, imagen no-captura, cancelación, reclamo, TTL, adjuntos handoff, anti-Frente-2 (check muestra ferias `proxima` de DB para comparar contra el bot).
+- **UI**: botón "Preparar número de prueba" (admin), botón "Comprobar" con semáforo por etapa, panel "Conversación con el bot" (auto-evidencia desde `conversaciones` — se eliminó el textarea respuesta_bot), selector de modo al crear run, resumen con checks fallidos + export "solo lo accionable" para memory.
+- **Commits PWA**: `c26a9b3` (E2E v2), `d5f15be` (UX simplificada para Camila: 2 tarjetas grandes, progreso, lenguaje directo), `3f7d671` (Badge con status colors reales — antes success/warning eran indistinguibles — + EstadoPagoBadge humanizado + meter ocupación en /ferias), `5454786` (home). El primero desplegado en Vercel; los otros 3 committeados y **pendientes de push** al cierre.
+
+### Gotcha nuevo — git vía Cowork device bridge
+git no puede borrar sus lock files (`Operation not permitted` en unlink): commit funciona pero deja `index.lock`/`HEAD.lock`/`tmp_obj_*`. Patrón: mover residuos a `.git/_stale_locks/` y JC corre `rm -rf .git/_stale_locks .git/index.lock && git push` en su Mac. **Regla de colaboración: todo commit se anuncia con el bloque de deploy completo copiable al final** (JC lo pidió tras 2 omisiones).
+
+### WIPE de actividad (sistema en desarrollo, autorizado por JC)
+Backup completo `e2e_backup.bk20260716_wipe_*` verificado por conteos; borrado: 209 conversaciones, 11 reservas, 6 sesiones, 4 handoffs, 97 notificaciones, 543 processed_wamids, 109 audit_log. **Vendedores (929, incl. 927 del CSV) y ferias INTACTOS por decisión de JC**; puestos todos `libre`. Storage (capturas/adjuntos históricos) no tocado. Backups históricos conservados.
+
+### Prompt v53 desplegado (threadId `_v53`)
+`promptPULGON_v53.txt`: SOLO fixes quirúrgicos sobre v52 — voseo residual en instrucciones internas (líneas 92, 104-108, 177, 292: vos/hablás/necesitás/usá/cerrás/respondé/cortá), join del único bloque con saltos de línea partidos (Regla Global 4), fusión del bullet duplicado del CTA del brochure. −90 chars, cero reglas eliminadas (diff verificado). Deploy verificado byte-idéntico por MCP. Veredicto de la optimización: el prompt no tiene redundancia recortable sin riesgo — está denso a propósito.
+
+### Auditoría de coherencia prompt ↔ tools ↔ knowledge (¡la lógica vivía en 3 lugares desincronizados!)
+- **7 descripciones de tools estaban en la arquitectura pre-1-jun**: actualizar_sesion ("call after EACH turn… missing fields will be cleared" — riesgo de borrar sesión), registrar_vendedor (email required vs opcional v49+), crear_reserva_tentativa (flag confirmacion_explicita + "send the EXACT summary phrase" vs respuesta_cliente_ultima + frase propia + no invocar en el turno del resumen), cancelar_reserva (pedía actualizar_sesion manual), notificar_humano ("any tool fails" — inducía escalar por falta_confirmacion), recuperar_sesion (estados fantasma, faltaba 'pagado'), brochure ("ask if they want to reserve" — doble CTA). → **TOOL_DESCRIPTIONS_v2.md** (raíz); JC las pegó en UI; verificadas 7/7 por MCP. Dato: input `confirmacion_explicita` del subscenario 5066880 está etiquetado "(deprecated)" — el mecanismo vigente es `respuesta_cliente_ultima`.
+- **pulgon_faq.md contradecía el prompt** en proceso de pago ("datos bancarios + contrato en el mismo mensaje" y captura con nombre/email/cédula/celular) → corregido: contrato al crear la reserva, bancarios cuando el cliente avisa estar listo, captura sin re-pedir datos (solo titular si cuenta de tercero).
+- **Dirección oficial de Cumbayá** (JC): "Mercado Cumbayá, Av. María Angélica Idrobo y Av. Interoceánica" — las DOS fuentes estaban mal (DB decía "Idrovo y Quito", sedes.md decía "Huidobro"). Corregida en pulgon_sedes.md + DB (sedes y las 3 ferias de la sede).
+- **Knowledge del agente**: exactamente 3 archivos (confirmado por JC + filestorage IDs en blueprint); JC re-subió faq y sedes corregidos (2 IDs nuevos, reglamento conservó ID). Sonda funcional OK (pregunta de captura → regla nueva). Los 5 archivos de `knowledge/` (MANUAL_VENDEDOR_FAQ, GUIA_SEDES, *_pulgui, REGLAMENTO_PULGON) son **letra muerta** — no están en el agente; contienen reglas viejas peligrosas (comida solo mesa completa, percha 5 USD sin distinción, "perchas que vendemos", 3 sillas media mesa, cierre 14:30) — candidatos a mover a `_deprecados/`.
+
+### Review crítico Make (contrastado con el 100% de memory.md + compound reviews + SPLIT + ARQUITECTURA)
+Patrones que se repiten: (1) IML/escapes ≥10 incidentes y el fix de jun introdujo el bug de jul — módulos 9 y 12 de 5069377 nunca verificados de verdad; (2) el Agent Beta degrada en los bordes y cada mitigación server-side funcionó vs las de prompt que reaparecen; (3) fixes anunciados sin cierre. **PLAN DE ATAQUE pre-run de Camila**: 1) fórmula monto_total media+comida en 5066880 (pendiente 12-jun SIN cierre — bug de plata), 2) Frente 2 filtro fecha/estado en 5066840 (con wipe + threads _v53 vírgenes, el vector "memoria del thread" quedó eliminado; si reaparece es la tool), 3) doble reserva out-of-guion (fix server del 15-jun nunca aplicado: cancelar tentativa previa vendedor+feria), 4) doble mensaje al validar pago (B8 + bot), 5) error handler en rama 111 de wa_inbound + defensa bot-mudo (riesgo maxErrors auto-desactiva), 6) borrar rama dormida, 7) checklist: normalizar nombres de ferias, artes Cumbayá subidos, push de Camila. Para la semana: rotar secretos, audit triple-escape en los demás _sb, log modelo_usado hardcodeado 'gpt-4o-mini' en módulo 20 de 5671936.
+- **Opinión arquitectónica** (registrada a pedido de JC): el techo es Make como runtime del agente; mejora de fondo = mover el cerebro a un endpoint TS (mismo repo PWA/Vercel o Edge Function) con las tools portadas como funciones contra Supabase — `wa_responder_bot_sb` es exactamente el punto de swap (CallSubscenario → HTTP call, rama actual como fallback). No antes de que el negocio valide (2-3 ferias cobrando).
+
+### Home PWA (commit `5454786`)
+- **Bug 1**: query del dashboard con `limit(3)` + tabla que descartaba la primera → "En horizonte" nunca mostraba más de 2 ferias y escondía cualquier 4ta. Ahora TODAS las futuras, con la próxima marcada con pill.
+- **Bug 2 (familia timezone)**: `diasHasta` comparaba DATE puro (medianoche UTC) vs timestamp local → desde ~19:00 de Ecuador el contador saltaba un día (mostraba 3 en vez de 4 para Cumbayá). Fix: días calendario en America/Guayaquil.
+- UX: meter de ocupación en hero, "HOY"/"es mañana", tooltips por barra en sparkline, KPIs en cero dicen "Al día"/"Nadie espera", pipeline antes que pulso.
+- Código muerto detectado (NO borrado, falta ok de JC): `components/dashboard/acciones-urgentes.tsx`, `semana-en-cifras.tsx`, `saludo.tsx`.
+
+### Pendientes al cierre
+1. **Push de JC** de los commits `d5f15be`, `3f7d671`, `5454786` (bloque de deploy en el chat).
+2. **F4 del E2E v2**: run smoke real de JC para calibrar checks (falsos rojos), luego run full de Camila.
+3. Plan de ataque Make 1-7 de arriba (mañana, antes del run de Camila).
+4. Mover `knowledge/` viejos a `_deprecados/` (con ok de JC).
+5. Semana: rotar secretos, audit triple-escape, modelo_usado del log.
+
+<!-- Cerrado: 2026-07-16 noche (E2E v2 desplegado; wipe hecho; v53 + 3 capas coherentes y verificadas; plan de ataque listo para pre-run Camila) -->
+
+---
+
+## Imports de datos
+
+- **2026-06-15** — Import masivo de contactos desde `contactos.vcf` a tabla `vendedores` (prod, proyecto Supabase `jzvnnowaytphtdwzufnh`).
+  - Qué: filtré los 10.314 vCards por keywords `pulgón/pulgon/pulgas/feria` (match substring) → 955 coincidencias → 921 números únicos tras normalizar a E.164 EC (`593XXXXXXXXX`) y deduplicar por número.
+  - Cómo: limpié el tag de feria del nombre (regex `\b(pulg[oóa]\w*|ferias?)\b`, cubre el mal escrito "Pulgad" y "Ferias"). `INSERT ... ON CONFLICT (whatsapp) DO NOTHING` para NO tocar los 6 vendedores previos. Marca `notas='Importado CSV contactos 2026-06-15'` en cada importado (la RPC `upsert_vendedor` no escribe `notas`, por eso INSERT directo). Total tabla: 6 → 927.
+  - Respaldo: `contactos_pulgon_filtrados.csv` en raíz del proyecto (whatsapp, nombre limpio, nombre_original, tag, tel_raw).
+  - Ojo: entraron varias entradas operativas no-clientas porque estaban etiquetadas (ej. "Pagado", "Comprador 1", "La Carolina", "Helados", varios "Apoyo"/"Seguridad", algunas "LISTA NEGRA"). 13 números son extranjeros/fijos (VE, UK, US, fijos EC). JC pidió incluir todos los que tuvieran teléfono. Para limpiar/bloquear luego: filtrar por `notas LIKE 'Importado CSV%'`.
+  - Riesgo: "Pulgas" es apellido ecuatoriano real → puede haber falsos positivos entre los importados (apellido Pulgas, no clienta de la feria).
+
+---
+
+## 2026-07-16/17 (tarde-noche) — Soporte en vivo del run E2E de JC: 15+ bugs cazados y corregidos sobre la marcha
+
+**Contexto:** JC corrió el smoke E2E completo (etapas 1→26) con su número (593998301965). Sesión de firefighting en vivo: cada bug se diagnosticó y corrigió sin frenar el run. Prompt terminó en v55, threadId en _v64. Todos los fixes verificados en vivo.
+
+### Bugs corregidos (en orden del run)
+
+1. **Falso HSM "reserva vencida" al re-reservar** (etapa 6): trg_cancelar_tentativa_previa auto-cancelaba y eso notificaba a Make → cliente recibía template de vencida. Fix: migración `skip_notify_make_en_autocancel` (early return si notas tiene el marcador de auto-cancelación).
+2. **Imagen no-captura crasheaba 3 escenarios** (etapa 11): `\"` dentro de `{{}}` en captions de tool_procesar_captura_pago_sb (módulos 9 y 12). Fix vía MCP round-trip. Reintento: SUCCESS 11 ops.
+3. **Arco mesa de comida** (etapa 12, 3 capas): FAQ con subsección "cliente con reserva activa pregunta por comida"; prompt v54 con rama nueva en REGLA GLOBAL 2 (sede aplicable = mencionada o la de sesión activa); **bot alucinaba la sede** (decía Los Chillos con reserva en Cumbayá) porque recuperar_sesion solo devolvía UUID → vista `sesiones_bot` (sesión + feria_nombre/fecha) + round-trip a 5066930. TOOL_DESCRIPTIONS_v2.md desc 6 actualizada.
+4. **Cancelar reserva por chat** (etapa 13, CUATRO bugs apilados): (a) falso verde del comprobador (contaba la auto-cancelada) → fix en e2e_verificar_etapa con detalle de última reserva; (b) bot confundía pago_validando con pagado y se negaba → refuerzo §6 en prompt; (c) **tool cancelar_reserva rota desde siempre**: `\"` en IML del body JSON (`ifempty(1.motivo; \"\")` → `emptystring`), fix MCP verificado con ambas ramas; (d) HSM "vencida" en cancelación voluntaria (rama Make reutiliza template wa_reserva_expirada_v1 para todo 'cancelado') → skip en trigger para cancelaciones vía bot (notas 'CANCELADA %'); las de Camila (RPC admin) siguen notificando.
+5. **Escalamientos invisibles en la PWA** (etapa 16): tool_notificar_humano solo mandaba WhatsApp, nunca escribía en notificaciones → campana muda. Fix: RPC `notificar_humano_pwa` (inserta notif tipo cliente_necesita_humano por cada operadora/admin) + módulo nuevo en la tool vía MCP. Además: bot dijo frase de escalado SIN invocar la tool tras 2 escalamientos previos (regla anti-insistencia pendiente para v56).
+6. **Inyección de contexto post-handoff NUNCA funcionó** (etapa 20): input pending_injection tipo TEXTO comparado contra booleano true en el if() del message del Agent → siempre falso. Fix inicial `= "true"`... y descubrimiento clave: **el editor de fórmulas de Make re-corrompe las comillas en CADA guardado del módulo** (cada bump de threadId lo rompía de nuevo, quedaba `(x = \"\"\"\") + true + \"\"\"\"` siempre-verdadero → summary inyectado en TODOS los turnos). Rediseño definitivo: RPC tool_estado_handoff_sb devuelve `inyeccion_handoff` pre-armado (vacío si no pending) + wa_inbound mapea ese campo (JC, UI) + message del Agent sin comillas: `{{1.handoff_summary}}[Cliente...]` — inmune al editor. Inyección legítima certificada (flag → contexto → consumo automático).
+7. **Descuento fantasma**: con la inyección siempre-activa, el bot afirmaba "descuento de 29 aplicado" y llegó a dar datos bancarios con monto 19 (48−29, sin percha). Regla v55: NUNCA afirmar descuento aplicado; el equipo lo aplica al validar. Verificada textual tras limpiar (v64): monto 53 correcto.
+8. **Auto-confirmación de reserva** (bot creó reserva con "completa" sin pedir SI/NO): el flag deprecado confirmacion_explicita seguía vivo como escape en los filtros de 5066880 → eliminado de ambos filtros vía MCP; confirmación 100% server-side por keywords.
+9. **Doble mensaje B8 CONFIRMADO** (etapa 21 validar pago): cliente recibía onboarding rico de la PWA (texto + artes) + HSM pago_recibido redundante de Make. Fix opción A: PWA dueña única — fallback a template si la ventana 24h está cerrada (commit a816eba); rama "pago validado" eliminada de pwa_acciones_camila vía MCP. Una validación = una confirmación, nunca cero.
+10. **Reserva manual sin contrato** (etapa 22, 4 bugs): /reservas/nueva huérfana (sin enlace) → botón (c98836a); picker mostraba vendedores archivados _pre_e2e_ → filtro (b3ca4b3); errores del webhook morían sin log → logging; **RAÍZ: RPC crear_reserva_manual devolvía whatsapp=parámetro de entrada (NULL con vendedor existente)** → el envío de contrato jamás se disparaba para vendedores existentes → migración `crear_reserva_manual_whatsapp_real` (whatsapp desde tabla vendedores). Verificado end-to-end.
+11. **Check de invitar_feria roto**: referenciaba audit_log.wa_from (no existe; es thread_id) → corregido.
+12. **Campana de notificaciones en desktop** al fondo del sidebar → flotante fija top-right con badge (040a5c2).
+
+### Otros verificados / decisiones
+
+- Etapa expiración TTL: reserva de sacrificio insertada + scheduler disparado manualmente vía MCP → expirado + HSM correcto + sesión cerrada, en un ciclo.
+- Handoff completo (tomar/adjunto/docs/devolver) OK; bot mudo con humano_activo ✓; summary de calidad.
+- Arte de Cumbayá confirmado subido (tachado del checklist). Arte de reglas no salió — revisar arte_reglas_url en /ajustes.
+- Guía entregada a Camila para crear template `wa_reserva_cancelada_v1` en Meta (Utilidad, 2 variables). Al aprobarse: swap en rama "reserva cancelada" de pwa_acciones_camila (lo hace Claude vía MCP). También corregir tildes/doble espacio de wa_handoff_a_humano_v2.
+- Push: 3 suscripciones vivas del 19-may; /perfil sin sección de estado push (backlog).
+- Bot sin guion para respuesta a invitación de feria (contrapregunta vaga) → regla para v56.
+- **Prompt v56 CREADO** (2026-07-17): regla 2c respuesta-a-invitación → flujo brochure directo, sin contrapreguntas. (Anti-insistencia y descuentos ya estaban en v55.) Pendiente: JC lo pega en el Agent.
+- **Lección operativa clave: fórmulas IML con comillas JAMÁS se editan por UI** (el editor las corrompe al guardar); texto plano (prompt/descripciones) sí es seguro por UI. Round-trips MCP con verificación (idealmente deep-diff) para todo lo demás.
+- Commits PWA de la sesión: a816eba, c98836a, b3ca4b3, 040a5c2 (este último pendiente de push al cierre).
+- Migraciones: skip_notify_make_en_autocancel, sesiones_bot_view, e2e_check_cancelar_excluye_autocancel, skip_notify_make_en_cancel_bot, notificar_humano_pwa_rpc, estado_handoff_inyeccion_precomputada, crear_reserva_manual_whatsapp_real, e2e_check_invitar_columna_thread_id (+ e2e_check_registro_email_opcional y notif_bot_mudo de la mañana).
+- Escenarios Make tocados vía MCP (todos verificados): 5066880 (×2), 5066909, 5066930, 4883716, 5671936 (×2, message del Agent), 5086803 (rama eliminada).
+
+### Pendientes al cierre
+
+- Run: quedan blast y notifs in-app (etapas cortas); luego run full con Camila.
+- Prompt v56 (batch de 2 reglas) cuando JC decida.
+- ~~Template wa_reserva_cancelada_v1~~ HECHO 2026-07-17: aprobado por Meta y conectado vía MCP en la rama 'reserva cancelada' de pwa_acciones_camila (mismas 2 variables; log actualizado). VERIFICADO en caliente 2026-07-17: cancelación desde PWA → cliente recibió el texto nuevo exacto ('fue cancelada... con gusto te ayudamos'), no el de vencida.
+- ~~/perfil: tarjeta de estado push~~ HECHO 2026-07-17 (commit 8d9ae41): sección 'Notificaciones push' en /perfil con estado por dispositivo y botón Activar (requestPermission + subscribe). Causa: al reinstalar la PWA el permiso vuelve a default y no había dónde re-pedirlo.
+- Picker de invitar-feria podría excluir vendedores con reserva pagada en esa feria (nota de negocio).
+- ~~error handler wa_inbound + rama dormida~~ HECHO 2026-07-17 (mañana, JC en UI guiado): rama dormida "DESACTIVADA vieja" eliminada (6 módulos, blueprint bajó de 168KB a 74KB); error handlers gemelos en ramas Solo texto (111→112→114→Skip) y Solo imagen (24→116→117→Skip): disculpa al cliente + notificar_humano (con campana) + Skip. Probado con fuego real (responder desactivado → hola → las 3 señales llegaron). wa_inbound sin pendientes estructurales.
+- Prompt v56 pegado y threadId en _v65 (2026-07-17).
+- **Smoke E2E COMPLETO** (29/29 etapas; blast migración la hizo JC el 16). Fuera de catálogo se probó el blast recordatorio-de-feria: FALLÓ con error Meta 132001 — el template `wa_recordatorio_feria_v2` que referencia el código NUNCA fue creado en Meta. Guía de creación entregada a JC/Camila (7 variables). Etapa nueva '24_blast_recordatorio_feria' agregada al catálogo para el run de Camila. Pendiente: crear+aprobar template y re-probar.
+- **Anti-fabricación de confirmación (2026-07-17 mediodía)**: el modelo creó una reserva pasando un respuesta_cliente_ultima que no era el mensaje del cliente (una sola ejecución, ruta de creación directa — probablemente incluyó su propio 'Listo, CEQ...' que matchea el keyword 'listo'). Fix determinista en 5066880 vía MCP: módulo 14 nuevo lee el último mensaje_cliente logueado en conversaciones (wa_inbound loguea ANTES de llamar al responder) y AMBOS filtros de confirmación corren sobre ese valor de la DB — el parámetro del modelo quedó decorativo. Verificado adversarialmente: scenarios_run con respuesta='dale' fabricado → falta_confirmacion, sin crear. TOOL_DESCRIPTIONS_v2.md #2 actualizada (pendiente pegar en UI). Observación menor pendiente: el bot también asumió percha pequeña sin preguntar talla, y violó el anti-doble-CTA tras el brochure — medir frecuencia en estrés.
+- Sigue pendiente: rotar secrets hardcodeados, modelo_usado hardcodeado, arte de reglas (arte_reglas_url en /ajustes), ambigüedad percha con Camila, mover knowledge viejos a _deprecados, componentes muertos del dashboard.
+
+### Adenda cierre (2026-07-16 noche, hora EC)
+
+- Template `wa_reserva_cancelada_v1` aprobado por Meta y conectado (rama 'reserva cancelada' de pwa_acciones_camila, vía MCP).
+- `promptPULGON_v56.txt` creado: sección 2c respuesta-a-invitación → flujo brochure. Pendiente que JC lo pegue.
+- Push tras reinstalar PWA: permiso vuelve a default y no había dónde re-pedirlo → tarjeta "Notificaciones push" en /perfil con estado + botón Activar (8d9ae41).
+- Etapa notif in-app: el texto pedía observar la campanita con un mensaje normal, pero el diseño anti-ruido no notifica con bot activo (solo cliente nuevo / handoff activo / re-engagement 4h+) y mensaje_inbound va al badge del Inbox — etapa reescrita con test de escalamiento (004d43c) + check acepta cliente_necesita_humano.
+- Campana flotante no actualizaba en realtime: colisión de nombre de canal Realtime entre las 2 instancias de NotifBadge en desktop → canal único por instancia (c64ab23).
+- Commits totales de la sesión: a816eba, c98836a, b3ca4b3, 040a5c2, 8d9ae41, 004d43c, c64ab23.
+- Blast quedó como única etapa sin ejecutar del smoke.
+- ~~Optimizar schedulers~~ **HECHO 2026-07-17 (mañana)** — patrón "DB decide, Make ejecuta":
+  - `vigia_schedulers()` en Supabase + pg_cron cada 10 min (job 'vigia-schedulers'): corre tool_timeout_humano_sb directo en DB y hace EXISTS baratos sobre reservas; solo si hay trabajo despierta a Make vía webhook (pg_net).
+  - `scheduler_expirar_reservas_sb` (5069315) y `scheduler_recordatorio_pago_sb` (5067091): convertidos a webhook-bajo-demanda vía MCP (hooks nuevos 2587510 fn2lacq... y 2587513 i6uklk...); lógica interna intacta.
+  - `scheduler_timeout_humano_sb` (5157491): DESACTIVADO — Make no aportaba nada (era 1 módulo llamando al RPC).
+  - `scheduler_recordatorio_feria_sb` (diario): se queda como está (~2 ops/día, trivial).
+  - Ahorro: de ~216 ops/día de polling en vacío (~6.500/mes) a CERO en vacío; precisión de TTL mejora de 30 → 10 min.
+  - Verificado: vigía en vacío no llama a Make; con reserva de sacrificio TTL vencido despertó a Make y la expiró (+HSM) en <10 s.
+  - Rollback si hiciera falta: `select cron.unschedule('vigia-schedulers')` + reponer scheduling interval en los 2 escenarios + reactivar 5157491.
+  - Hardening post-incidente (error Meta 131009 de madrugada, número inválido de vendedor archivado _pre_e2e_): módulos HSM de ambos escenarios ahora con stopOnHttpError=false (un número malo ya no aborta el batch ni causa reintentos infinitos); el vigía solo despierta el recordatorio si hay números enviables (regex ^[0-9]{10,15}$). La expiración despierta siempre (el cambio de estado importa aunque el HSM falle).
+- **Próxima sesión: pruebas de estrés** (plan a diseñar: harness de webhooks sintéticos contra wa_inbound con números whitelisted, ráfagas mismo thread, concurrencia multi-thread, replay/dedup de wamids, expiración TTL masiva, blast, límites Meta/Make).
+
+<!-- Cerrado: 2026-07-17 (madrugada, actualizado). Run E2E smoke de JC: 24/26 etapas ejecutadas, 15+ bugs corregidos en vivo. Sistema notablemente más sólido que ayer. -->
+
+## 2026-07-17 (tarde) — Batería de estrés completa + fix venenosos + templates
+
+### Batería de estrés (registro completo en tabla `stress_log`, informe en INFORME_ESTRES_2026-07-17.md)
+- Harness: schema `stress_bk` (respaldo 8 tablas, SE CONSERVA unos días), `stress_msg(p_from,p_nombre,p_text,p_msg_id)` inyecta webhook formato Meta vía pg_net al hook de wa_inbound, vista `stress_latencias`, tabla `stress_log`. Harness se conserva para futuras baterías.
+- Resultados: 7 fases, 6 PASS + 1 FAIL corregido en vivo.
+  - F0 baseline 5.3s. F1 ráfaga 5/5 en orden (hallazgo: bot mudo en "hola", fallback OK). F2 replay dedup OK (cosmético: inbound duplicado se loguea 2×). F3 concurrencia 3 threads aislados (hallazgo modelo: "chillos" gatilla guion comida). F4 TTL masivo 21/21 en 18.2s (bonus: trg 1-pendiente-por-vendedor limita radio de daño). F6 contaminación 13 msgs presión: 0 descuentos, 0 reservas sin confirmar, escalamientos con resúmenes precisos.
+- **F5 venenosos — el bug serio**: texto/perfil con comillas dobles rompía los cuerpos jsonString y el log moría en silencio (wa_inbound mód 104 con error tragado por Ignore → SUCCESS falso y 0 filas; wa_responder mód 20 crasheaba por profile_name crudo DESPUÉS de enviar la respuesta). Cliente sí recibía respuesta; se perdía todo el rastro → gate anti-fabricación leía mensaje viejo, bot_mudo ciego, PWA sin historial.
+  - FIX A (wa_responder 5671936, vía MCP round-trip con deep-diff 0): mód 19 (sanitizador muerto — su salida no se usaba) revivido para sanitizar `{{1.wa_profile_name}}` (patrón ["\n\r\t\\] → espacio); mód 20 usa `{{19.text}}`; mód 17 ahora también limpia backslash (["\s\\]+).
+  - FIX B (wa_inbound 4820192, vía UI por JC): módulos Text parser Replace nuevos **132** (sanitiza {{34.wa_text}}) y **133** (sanitiza {{3.wa_profile_name}}) entre 34 y 29; body del mód 104 repegado apuntando a 132.text/133.text.
+  - Sanitización SOLO para el log; el Agent recibe el texto original intacto (paso estructurado de CallSubscenario es seguro).
+  - Re-verificado: 3 venenosos re-disparados → 6/6 filas logueadas, 0 errores.
+  - NOTA mód 18 responder: `"to":"[{{1.wa_from}}]"` con corchetes literales — raro pero FUNCIONA en prod, no tocar.
+- Hallazgos candidatos (decisión pendiente): retry-on-empty para bot mudo; dedup del log en replay Meta; alcance REGLA GLOBAL 2 ("chillos"→comida); desuscribir message_status en Meta (callbacks = ~2 ops facturables por HSM saliente); ventana dedup de notificaciones en escalamientos repetidos; desliz leve de contexto en threads largos.
+- Limpieza hecha: 147 notifs, 58 conversaciones, 21 reservas, 20 sesiones, 30 wamids, 20 vendedores stress borrados. `stress_log` y harness se quedan.
+
+### Templates Meta (chequeo vía Graph API, WABA 1667567467761683)
+- 21 templates, todos APPROVED. `wa_reserva_cancelada_v1` ya conectado y verificado (ayer).
+- Recordatorio feria: Camila creó DOS aprobados — `wa_recordatorio_feria_v2` (cuerpo corto) y `_wa_recordatorio_feria_v2` (guion bajo inicial, cuerpo largo de la guía). JC eligió la larga → commit **995c0a5** (route.ts blast + etapas.ts apuntan a `_wa_recordatorio_feria_v2`). Pendiente: re-test blast desde PWA (esperado 1 enviado · 0 fallidos). Sugerencia: pedir a Camila borrar el corto en Meta para evitar confusión.
+- PENDIENTE Camila: fix tilde/doble espacio en `wa_handoff_a_humano_v2` ("ya esta aquí") y coma huérfana en `wa_handoff_a_bot_v1` ("{{1}}, ."). Sin versiones nuevas aún.
+
+### Estado
+- Sistema validado para volúmenes reales de Camila (3-5 msg/h pico, 20-60/día) con margen ~10×.
+- Siguiente: run E2E full con Camila (registrar su push primero en /perfil).
+
+### Plan B / continuidad (2026-07-17, tarde-noche)
+- **Vigía de salud** (migración `vigia_salud_plan_b`): pg_cron `vigia-salud` (*/10) → `vigia_salud()`: (1) ping a pulgon-pwa.vercel.app/api/health con patrón pg_net asíncrono (evalúa la respuesta del ciclo anterior; alerta con 2+ fallos, dedup 6h), (2) silencio de clientes 5h+ en horario 9-20 Ecuador (dedup 12h). Alertas vía `vigia_enviar_alerta()` → HSM alerta_operadora directo DB→Meta (token en **Vault** `meta_token_vigia` — primer secret fuera de hardcode). Destinatarios en `vigia_destinatarios` (hoy: JC; falta Camila). Estado/diagnóstico en `vigia_salud_estado`. Pausar: cron.unschedule('vigia-salud').
+- PWA commit **1c73ccd**: `/api/health` público (GET, select trivial a ferias, exento del middleware auth como /api/push/dispatch).
+- **RUNBOOK_EMERGENCIAS.md** nuevo en raíz: matriz de qué sobrevive a cada caída, rollback instantáneo Vercel, SQL de validación manual de pago, protocolo Make caído, último recurso (desregistrar número → app WhatsApp Business de Camila, requiere PIN 2FA ¡verificar que esté anotado!), coexistencia Meta como proyecto futuro.
+- Guía E2E para Camila entregada en pantalla (estados OK/Observaciones/Bloqueante/Pendiente + checks automáticos; recomendación compu para PWA + teléfono para WhatsApp; push en el teléfono).
+- v57 creado (ANTI-FALSO-POSITIVO "chillos"=sede en REGLA GLOBAL 2) — pendiente confirmar pegado en UI + bump _v66.
+
+### Cierre 2026-07-17 (noche)
+- Vigía verificado END-TO-END: HSM de prueba LLEGÓ al WhatsApp de JC (canal DB→Meta OK); /api/health en producción responde {"ok":true} con lectura real de DB (commit 1c73ccd deployado); cron marcando ciclos OK.
+- **Blast recordatorio de feria EXITOSO en producción**: template largo `_wa_recordatorio_feria_v2` (commit 995c0a5), 1 enviado · 0 fallidos. Cierra el gap 132001 descubierto ayer. Etapa 24 del E2E queda verificable.
+- v57 pegado en UI + bump a `_v66` confirmados por JC (fix "chillos"=sede vivo).
+- Pendientes de JC/Camila: PIN 2 pasos del número (guía entregada a Camila), número de Camila para `vigia_destinatarios`, fixes de templates handoff (tilde + coma), borrar template corto `wa_recordatorio_feria_v2` en Meta, decisiones de negocio (picker invitar excluye pagados, percha medidas, cancelar captura_recibida), run E2E full de Camila (push de ella primero en /perfil — guía del módulo ya entregada).
+- Pendientes míos cuando JC diga: desglose de percha en contrato HSM (tool_enviar_contrato_sb), re-correr checks viejos en rojo (00, 11), candidatos de estrés (retry bot mudo, dedup log replay, unsubscribe message_status, dedup notifs escalamiento), modo espejo (capa 4, diseñado), coexistencia Meta (proyecto futuro).
+
+<!-- Cerrado: 2026-07-17 (noche). Batería de estrés 7 fases completa + fix venenosos + scheduler opt + plan B (vigía+runbook) + templates conectados. Sistema listo para run full con Camila. -->
+
+### 2026-07-18 — Run E2E de Camila (28/29) + fix triple-blast
+- Run 55406dda "Ronda 3": 14 OK, 11 observaciones, 4 bloqueantes. Corregí en vivo su número (0984652033 → 593984652033) para que los checks evaluaran el thread real. Falta etapa 14 (TTL, requiere forzado manual).
+- Triage de bloqueantes: 04 registro NO-bug (Camila ya era vendedora del 13-jul; etapa 00 sin preparar → sin wipe → registro de cliente nuevo SIN PROBAR); 10 imagen no-captura = por diseño (revisar UX); 23 triple-blast = BUG REAL; 19 devolver-bot "no activa la reserva" = por investigar.
+- **Fix triple-blast (commit 199ae70)**: confirmado en DB 3 envíos de migracio_canal a su número en 10 s (20:30:03/:06/:13, confirmaciones repetidas). Idempotencia server-side: no reenviar mismo template a mismo vendedor dentro de ventana (migración 24h; recordatorio feria 20h), en action + ambas rutas API; UIs muestran "omitidos". PENDIENTE push+deploy de JC.
+- Bugs medianos del run (cola): (12) tras cancelar comida el bot negó la reserva activa de Cumbayá existente; (20) de 2 capturas enviadas solo 1 visible en la app; (21) reserva manual comida no guarda flag de comida; (24) tras blast el bot re-pidió pago ya validado (sesión desactualizada).
+- Camila resolvió la ambigüedad de perchas (medidas máximas según mesa, texto exacto en su comentario de etapa 05 → meter a FAQ/prompt) y pidió feature: blast de reactivación a contactados sin respuesta.
+- Copy por pulir: formato datos bancarios, sábado→domingo, "comida es aparte"+listado al confirmar, "puesto se asigna el sábado en la tarde", ruta "ya pagada" en reserva manual, consigna etapa 00 + normalizar 09→5939 en el form del run.
+
+### 2026-07-19 (madrugada) — Fix bug 12 (multi-reserva) COMPLETO, verificado sintético
+- Defensa en 3 capas: (1) migraciones `sesiones_bot_reservas_activas` + `reservas_activas_con_sede`: la vista agrega columna reservas_activas = TODAS las reservas vivas del vendedor con "<feria> (sede: X) fecha | estado | monto | reserva_id" (' ;; '), la sede legible es clave porque "CEQ" es opaco para el modelo; (2) tool_recuperar_sesion_sb (5066930) expone reservas_activas vía MCP round-trip (mód 3 info_sesion + select=* ya lo traía; deep-diff 0; subagente); (3) migración `gate_sede_en_cancelar_reserva`: RPC cancelar_reserva ahora rechaza (sede_no_coincide) si el último mensaje logueado del cliente menciona exactamente una sede y no coincide con la feria del reserva_id — verdad-DB, mismo patrón del gate anti-fabricación. Prompt v58 (regla MULTI-RESERVA en §6) + descripción de recuperar_sesion pegados por JC; threads _v67.
+- Verificación sintética (4 iteraciones): intento 1 SIN gate canceló la reserva equivocada (confirmó necesidad); intento 2 gate rechazó y bot escaló correcto la pagada; intento 3 reveló mapeo CEQ↔Quito imposible → sede en la vista; intento 4 PASS: pendiente por sede correcta cancelada + pagada escalada, nunca negó existencia. Registrado en stress_log (fix_bug12_multireserva). Datos de prueba limpiados (3 vendedores 59399000007x).
+- LECCIÓN operativa: execute_sql con múltiples statements devuelve SOLO el último resultado — queries de verificación SIEMPRE de a una (me hizo perseguir un fantasma de "mensaje no procesado").
+- Pendientes cola Camila: (20) captura no visible en app, (19) devolver-bot "no activa la reserva", (21) flag comida en reserva manual, (24) re-pide pago validado, normalizar 09→5939 + consigna etapa 00, copys.
+
+### 2026-07-19 — Fix bug 20 (captura de pago sobrescrita)
+- Diagnóstico: toda imagen entrante se procesa como captura y PISA captura_pdf_url/monto/referencia de la reserva — la foto random de la etapa 10 de Camila (135134.jpg) borró la transferencia real (133820.jpg) del puntero de la reserva de Cumbayá. Los archivos siempre quedan en storage; se perdía solo el puntero.
+- Fix (migración `proteger_captura_pago_overwrite`): trigger `trg_proteger_captura_pago` BEFORE UPDATE en reservas — si la reserva está en captura_recibida/pago_validando/pagado y llega una captura nueva, se CONSERVA la original y la nueva se anexa a notas como "captura adicional <fecha>: <url> (monto leido: X)". Además una imagen basura jamás des-valida un pagado. Cuando Camila rechaza una captura (estado sale del flujo de pago), la siguiente sí puede reemplazar.
+- Verificado con reserva sintética (2 casos: captura_recibida y pagado — original intacta, basura a notas). Dato de Camila REPARADO: reserva Cumbayá re-apuntada a la transferencia real, con nota de auditoría (trigger deshabilitado momentáneamente para la reparación).
+- Nota: el flujo Make (5069377) no se tocó — sigue alertando a la operadora por cada imagen; la protección vive en DB.
+
+### 2026-07-19 — Bug 19 + paquete de copys → v60
+- Bug 19 diagnóstico: el summary del handoff era PERFECTO ("DATOS CRÍTICOS: valor de la mesa en 25 USD") y la inyección SÍ se consumió en el turno — el modelo lo ignoró y priorizó sesión cerrada ("ya no está activa para pago"). Hueco operativo adicional: el bot no puede registrar precios fuera de tabla → acuerdos especiales requieren reserva manual ANTES de devolver.
+- Fixes: v59 regla dura POST-HANDOFF (contexto handoff MANDA sobre sesión/memoria; prohibido callejón sin salida; si no puede ejecutar el acuerdo → "el equipo va a dejar registrada tu reserva" + notificar_humano con el acuerdo). PWA commit 3ba2709: hint en el panel de handoff ("crea la reserva manual ANTES de devolver").
+- **v60 = v59 + copys de Camila** (para un solo pegado): línea de trazabilidad al inicio (# promptPULGON v60 (fecha)), datos bancarios en LÍNEAS SEPARADAS (excepción de formato), regla día de feria (corregir sábado→domingo, nunca repetir el día equivocado), "la mesa de comida es aparte" + NO confirmar mesa de comida sin listado de productos, REGLA OPERATIVA 2 de percha (preguntar "¿tu percha está dentro de las medidas?" + medidas por mesa en líneas; pequeña/grande son precios, no catálogo). FAQ ya tenía las medidas correctas — sin cambios de knowledge.
+- PWA commit 2333578: puesto sin asignar → "Tu puesto asignado se te enviará el sábado en la tarde" (confirmación de reserva y de pago).
+- CONVENCIÓN NUEVA (pedida por JC): trazabilidad de versiones — prompt lleva línea 1 "# promptPULGON vN (fecha)"; knowledge lleva su [REF]+fecha en línea 1 (ya lo hacía); descripciones de tools llevarán sufijo "(vN YYYY-MM-DD)" al final de aquí en adelante.
+- Pendiente inmediato: JC pega v60 + bump _v68 + push (3ba2709, 2333578) → verificación sintética del post-handoff. En cola: (21) flag comida reserva manual + ruta "ya pagada", (24) re-pide pago validado, normalizar 09→5939 + consigna etapa 00.
+
+### 2026-07-19 (cierre) — v60 verificado + pipeline de saltos de línea
+- Verificación sintética post-handoff (bug 19): handoff con "25 USD" acordado sobre sesión cerrada → el bot respondió "el monto es 25 USD como acordamos" + datos bancarios + pedir captura. CERO callejón sin salida. Matiz: no escaló para que registren la reserva a 25 (el flujo de captura alertará al equipo igual) — aceptable.
+- **HALLAZGO + FIX estructural**: el sanitizador del responder (mód 17, ["\s]) colapsaba TODOS los saltos de línea de TODA respuesta del bot — causa raíz real del reclamo de datos bancarios apretados (etapa 07). Round-trip MCP en 5671936: mód 17 ahora ["\\ \t]+ (preserva \n\r), módulo NUEVO 21 convierte \n\r → escape literal \n (JSON-safe, Meta lo renderiza), mods 18/20 usan {{21.text}}. Flujo: 1→3→16→17→21→18→19→20→2. Deep-diff 0; el subagente detectó y preservó el pegado de v60 + bump _v68 de JC.
+- Verificado en vivo: datos bancarios llegan en 5 líneas (Banco / tipo cuenta / número / titular / cédula / monto). Percha responde con el contenido exacto de Camila (medidas por mesa + "¿tu percha está dentro de estas medidas?") aunque en comas — el modelo a veces elige frase corrida; contenido correcto, formato variable.
+- Datos sintéticos limpiados (vendedores 074/075, handoffs, etc.).
+- Estado prompt: v60 en UI, threads _v68. Cola restante: (21) flag comida reserva manual + ruta "ya pagada", (24) re-pide pago validado, normalizar 09→5939 + consigna etapa 00, checks rojos viejos (00/11), desglose percha en contrato HSM, hallazgos menores de estrés.
+
+### 2026-07-19 — Sesión corta 1: bug 21 (flag comida)
+- Diagnóstico: NO era bug de datos — crear_reserva_manual guarda tiene_mesa_comida y suma el adicional correctamente (la reserva de Camila: flag true, monto 53). Era visualización: la lista /reservas no mostraba comida ni percha.
+- Fix commit **31aeece**: la lista muestra "+ comida" y "+ percha" junto al tipo de mesa. PENDIENTE push de JC.
+- La "ruta ya pagada" en reserva manual queda como feature para sesión aparte (necesita decisión de flujo: checkbox al crear → estado pagado directo + saltar mensaje de datos de pago).
+- Cola priorizada restante: (24) re-pide pago validado tras blast → luego normalizar 09→5939 + consigna etapa 00 → cosméticos (checks rojos, desglose percha HSM).
+
+### 2026-07-19 — Sesiones cortas 2 y 3
+- (2) Re-pide pago validado (etapa 24): con reservas_activas el bot YA nombra la reserva correcta, pero decía "en revisión" de una PENDIENTE e ignoraba la pagada. **v61** = v60 + REGLA ESTADO DE PAGO en §7 (responder estado real POR CADA reserva: pagado=validado / captura=en revisión / pendiente=sin transferencia aún; prohibido "en revisión" de pendiente y re-pedir pago de pagada). PENDIENTE: JC pega v61 + bump _v69 → re-test sintético (vendedor 593990000073 con pagada Cumbayá + pendiente Chillos QUEDA MONTADO para el re-test; limpiar después).
+- (3) Commit **f2bbf4a**: crearRun/actualizarRun normalizan número EC (09→5939, tolera +/espacios/guiones); etapa de datos del run reordenada ANTES de la limpieza automática + consigna reescrita. PENDIENTE push.
+
+### 2026-07-19 — Cierre sesiones cortas
+- v61 pegado + _v69. Re-test estado de pagos: PASS perfecto ("tu pago de CUMBAYA (48 USD) ya está validado, el de Chillos (53 USD) está pendiente, te falta esa transferencia"). Bug 24 CERRADO. Sintéticos limpiados.
+- Estado global post-E2E-Camila: de sus 4 bloqueantes + 4 bugs medianos, TODO resuelto y verificado excepto cosméticos. Prompt v61 en UI, threads _v69.
+- Cola restante (baja prioridad): checks rojos viejos (etapas 00/11 del run de Camila — re-correr desde la PWA), desglose de percha en contrato HSM (tool_enviar_contrato_sb), feature "ya pagada" en reserva manual (diseñar), hallazgos menores de estrés (retry bot mudo, dedup log replay, unsubscribe message_status, dedup notifs), idea de Camila: blast de reactivación a contactados sin respuesta.
+- Pendientes de Camila sin cambios: templates handoff (tilde/coma), borrar template corto de recordatorio, PIN 2 pasos, su número para vigia_destinatarios.
+
+### 2026-07-19 — Tanda final de cierre
+- Hallazgos menores de estrés: (b) dedup atómico del log inbound — índice único parcial uq_conversaciones_inbound_wamid + RPC tolera unique_violation (migración dedup_inbound_y_notifs_escalamiento); (d) dedup 15 min en notificar_humano_pwa por thread (OJO: la primera migración creó un overload de 3 params por error — corregido en dedup_notificar_humano_pwa_correcto, que droppea el overload y agrega el guard a la firma real de 4 params preservando formato byte a byte; LECCIÓN: leer la definición original ANTES de reemplazar un RPC); (a) retry bot-mudo: DECISIÓN aceptar el fallback actual (retry en Make duplicaría costo); (c) unsubscribe message_status: instrucciones entregadas a JC (manual, app de Meta).
+- Contrato HSM itemizado (tool_enviar_contrato_sb vía MCP, deep-diff 0, sin módulos nuevos): select= del GET amplía campos y tipo_mesa_label ahora renderiza "mesa completa (48) + espacio percha grande (10)" etc.; total sigue siendo monto_total sin recalcular. Nota: la expresión usa comillas dentro de {{}} siguiendo el patrón preexistente de ESE campo (SetVariables, no jsonString) — editado por MCP, sin riesgo de UI.
+- PWA commit **e5920cb**: (1) checkbox "La reserva ya está pagada" en reserva manual → crea pagada + confirmación con artes/reglamento, sin contrato ni datos de pago; (2) blast de reactivación: botón "Reactivar invitados" en la feria, ruta /api/ferias/[id]/blast-reactivacion (invitados por audit_log sin reserva viva, dry-run + confirm, idempotencia 48h, template **wa_reactivacion_v1** — CAMILA DEBE CREARLO EN META: 2 vars, {{1}}=nombre, {{2}}=feria).
+- PENDIENTE JC: push (e5920cb) + pasarle a Camila el spec del template + los 3 pasos de message_status.
+
+### 2026-07-19 — CIERRE DE SESIÓN (próximo chat: Opus 4.8)
+- Entregado a JC: bloque de push (e5920cb pendiente al cierre), guía Camila para crear template wa_reactivacion_v1 en Meta (Utility, es, 2 vars, body exacto en la guía), y resumen en lenguaje simple del trabajo del día para Camila.
+- ESTADO FINAL: prompt v61 en UI / threads _v69 / 21 templates Meta + wa_reactivacion_v1 por crear / vigía de salud activo / stress_bk por borrar en unos días / harness stress_msg disponible.
+- Todo el detalle de la sesión en las entradas de arriba (2026-07-17 a 2026-07-19) + HANDOFF_2026-07-19.md.
+
+### 2026-07-19 — PLAN_PRODUCCION_V1.md creado (raíz del proyecto)
+- Diseño de lanzamiento: sistema de DOS canales — número oficial (el Cloud API actual, NO uno nuevo: todo cableado, templates en la WABA, vigía activo) para el negocio con bot 24/7 + panel, y el personal de Camila intacto como canal humano y plan B viviente. Migración por cohortes (piloto = vendedores de la próxima feria → activos → base histórica), anuncio de confianza DESDE el personal de Camila ANTES del template migracio_canal, verificación del negocio en Meta para límites de envío, semáforo de métricas (adopción >50%, resolución bot >70%, calidad verde) con criterios de freno. Fase 0 = los pendientes del backlog actual (secrets, PIN, templates, limpieza, probar registro-nuevo y TTL real).
+
+### 2026-07-20 — Ronda 4 preparada + fix "editar feria no guarda"
+- Run "Ronda 4 — desde cero" (14e77cb5) creado y preparado con e2e_preparar_run: backup e2e_backup.bk20260719_run14e77cb5 (100 convs, 53 notifs, 3 reservas, handoff), vendedor archivado 593984652033_pre_e2e_20260719, threads _v69 vírgenes para ella. Camila marca etapas 00/01 y arranca del saludo — esta vez SÍ ejercita registro de cliente nuevo.
+- **Bug artes (commit 90f0fb7)**: editar una feria existente NO guardaba — los NULL de la DB (mapa_mesas_url, arte, notas) entraban como defaultValues y zod rechazaba null → submit bloqueado EN SILENCIO (los campos de upload no mostraban error). Al crear sí funcionaba (undefined). Fix: preprocess null→''/undefined en feriaSchema + error visible en campos de reglamento/afiche/mapa. Los uploads de Camila SÍ estaban llegando a storage (4 archivos huérfanos en artes/confirmacion de hoy) — tras el deploy debe re-subir y guardar. PENDIENTE push de JC.
+- LECCIÓN: defaultValues desde rows de Supabase deben sanitizar NULLs, y todo campo de form debe renderizar su error — un bloqueo invisible de validación se reporta como "no guarda".
+
+### 2026-07-20 — Cierre de sesión
+- Últimos entregables: PLAN_PRODUCCION_V1.md (raíz), Ronda 4 preparada para Camila, fix editar-feria (90f0fb7, PENDIENTE push al cierre).
+- Al retomar: verificar push de 90f0fb7 (y e5920cb si quedó colgado), confirmar que Camila pudo subir artes y avanzar su Ronda 4, y seguir el plan de producción (Fase 0 = backlog con dueños).
+
+<!-- Cerrado: 2026-07-20. Sesión Fable completa (16-jul → 20-jul): E2E smoke JC + batería estrés + E2E Camila digerido + plan B + plan producción. Continúa Opus 4.8. -->
+
+### 2026-07-20 — UPGRADE DE CEREBRO del Agent (cambio mayor)
+- Hallazgo raíz del "bot cansón que re-pregunta": **Maximum conversation history estaba en 2** en el módulo AI Agent de Make — el modelo solo veía las últimas 2 respuestas; toda decisión de 3+ turnos atrás se evaporaba (explica la amnesia del run de Camila, el re-preguntar de fase 6 y la confusión post-blast). El contexto conversacional viene del THREAD de Make (limitado por ese parámetro); la DB solo aporta estado vía recuperar_sesion.
+- Cambios aplicados por JC en la UI: **history 2 → 12**, **modelo gpt-4.1-mini → gpt-5-mini** (input $0.25/M vs $0.40 — más barato donde duele; output $2 vs $1.60 irrelevante con respuestas de ~50 tokens), **threads → _v70**.
+- Ronda 4 de Camila RE-preparada para probar el cerebro nuevo completo: e2e_preparar_run de nuevo (backup bk20260720_run14e77cb5: 27 convs del run viejo + vendedor con cédula typo 171053861 archivado como _pre_e2e_20260720), 5 marcas de etapas borradas del run 14e77cb5. Tablero en blanco, thread _v70 virgen, misma "Ronda 4 — desde cero".
+- OJO al evaluar el run nuevo: cualquier mejora/regresión vs comportamientos conocidos ahora tiene DOS variables (modelo + memoria). Los gates de verdad-DB quedan idénticos como red de seguridad.
+- Pendiente cosmético: log del responder registra modelo_usado='gpt-4o-mini' hardcodeado (mód 20 de 5671936) — actualizar a gpt-5-mini en el próximo round-trip.
+
+### 2026-07-21 — Análisis del primer test con gpt-5-mini + 3 fixes
+- Diagnóstico del test "decepcionante" de JC: NO fue regresión — el modelo nuevo sostuvo mesa+percha+comida+listado por 10 turnos, matemática correcta, 4 reglas v61 en una respuesta, escalamiento correcto, contrato itemizado OK. Los 3 problemas reales eran pre-existentes o nuestros:
+  1. **Bot ciego a la fecha** → FIX: mensaje del Agent ahora arranca con "[Hoy es {{formatDate(now; DD/MM/YYYY; America/Guayaquil)}}]" (mód 3 de 5671936, MCP) + vista reservas_activas marca "[FERIA YA REALIZADA]" (migración reservas_activas_marca_ferias_pasadas). VERIFICADO: "tu feria fue el DOMINGO 19 de julio y ya se realizó... próxima edición el DOMINGO 9 de agosto".
+  2. **Gate anti-fabricación rechazaba "Confirmada"/"confirmé"** (contains 'confirmo' era demasiado estricto — causó el triple ¿confirmas?) → FIX: contains 'confirm' en ambos filtros de 5066880 (complementariedad verificada byte a byte). VERIFICADO: "Confirmada" crea la reserva al primer intento.
+  3. **Falsa alarma del error handler** (disculpa + ATENCION sin ninguna ejecución fallida; etiqueta "rama Solo texto" copiada también en la rama imagen) → EN OBSERVACIÓN, sin pérdida de datos; si se repite, excavar blueprint de wa_inbound (handlers y sus textos).
+- INCIDENTE de subagentes: el primer subagente murió por créditos A MITAD del round-trip dejando aplicado el prepend pero la INTERFACE del responder VACÍA (habría roto los CallSub) — el agente fresco lo detectó y reparó. LECCIÓN: tras cualquier fallo de subagente en un round-trip, verificar interface del escenario tocado.
+- Effort de gpt-5-mini: JC lo subió low→medium. Recomendación dada: QUEDARSE en medium (high = más latencia por turno y nos acerca al timeout ~40s de los CallSub, más falsas alarmas). Revisar solo si aparecen fallas de razonamiento puro.
+- Cosmético pendiente aún: modelo_usado='gpt-4o-mini' en el log (mód 20 de 5671936).
+
+### 2026-07-21 — Gate "sí + algo más" + v62 tono conversacional
+- Gate 5066880 ampliado (subagente, deep-diff 0): además de exactos si/sí/ok y contains confirm/dale/perfecto/listo/claro, ahora acepta mensajes que EMPIEZAN con "si"/"sí" + espacio o coma (substring 0..3) — cubre "sí quiero", "si porfa", "sí, procede" sin falsos positivos de contains("si"). Ambos filtros byte-idénticos y complementarios.
+- **promptPULGON_v62.txt** en raíz (JC pega): sección nueva "# Tono conversacional" antes de Contexto del mensaje — (1) respuesta autosuficiente (incluir mesa/feria/fecha aunque no lo pidan; ejemplo MAL/BIEN con el caso real de JC), (2) reapertura humana breve tras silencio/cambio de tema (sin habilitar CTA), (3) naturalidad dosificada (exclamación ocasional, emoji solo espejo o celebración, máx 1). Prohibiciones de estilo intactas. Racional: el laconismo era coraza para 4.1-mini con memoria 2; con 5-mini + memoria 12 el bot puede ser cálido sin ruido. Sugerido bump a _v71 al pegar (para que el historial lacónico no ancle el tono).
+
+### 2026-07-21 — v62 vivo + números limpios para pruebas
+- JC pegó v62 (tono conversacional) y bumpeó threads a **_v71**. Config actual del Agent: gpt-5-mini, effort medium, history 12, prompt v62, threads _v71.
+- Números de prueba LIMPIOS con el mecanismo oficial (reservas incluidas, todo respaldado):
+  - Camila 593984652033: ya estaba virgen (0 filas); marcas de Ronda 4 (14e77cb5) borradas. Lista para arrancar del saludo.
+  - JC 593998301965: run nuevo "Pruebas JC — v62/gpt-5-mini" (0bfa593b), backup bk20260720_run0bfa593b (204 convs, 98 notifs, 9 reservas, 1 handoff), vendedor archivado _pre_e2e_20260720, 1 pendiente cancelada. Virgen total.
+- Estado de fixes de la ronda: fecha ✓ verificado, gate confirm ✓ verificado, gate "sí + algo" ✓ aplicado (deep-diff 0), tono v62 ✓ pegado (por probar), falsa alarma handler EN OBSERVACIÓN, modelo_usado hardcodeado pendiente cosmético.
+
+### 2026-07-21 (noche) — v63 (3 fixes de prompt) + FALSA ALARMA DE CAPTURA CAZADA (era cableado, no fantasma)
+Prueba de JC post-v62 (cliente nuevo, reserva + pago). Tono mejor pero 4 hallazgos → 3 de prompt (v63) + 1 técnico (por fin resuelto).
+
+**promptPULGON_v63.txt** en raíz (JC pega, bump sugerido _v72). Sobre v62, 3 reglas:
+1. **## 5b. Orden del cierre con cliente NUEVO**: registro COMPLETO (registrar_vendedor) ANTES de resumen+"¿confirmas?". PROHIBIDO pedir "¿confirmas?" a un cliente sin registrar. Mata el doble-confirmas que vio JC: el bot preguntó "¿confirmas?" antes de registrarlo, el "Sí" no pudo ejecutar (sin vendedor), lo registró y re-preguntó. (El gate "Ya te había confirmado" pasó al primer intento → confirma que el fix del gate sirve; el bug ahora era ORDEN de flujo, no el gate.)
+2. **Producto ya nombrado = listado inicial**: si el cliente ya dijo qué vende al pedir la mesa ("quiero vender carne en palito"), ESO es el listado — guardar de inmediato con actualizar_sesion, NO re-preguntar; solo "¿venderías algo más aparte de X?". (Insertada antes de la regla comida-listado existente.)
+3. **# Solicitudes pendientes con el equipo**: tras escalar algo (p.ej. cancelación de reserva pagada), reconocer esa solicitud pendiente en las respuestas siguientes; responder preguntas de política ("¿no puedo cancelar por estar pagada?") en vez de repetir "el equipo ya está avisado". Mata la incoherencia post-escalamiento ("todo en orden, estás listo para la feria" tras haber escalado la cancelación).
+
+**FALSA ALARMA DE CAPTURA — RESUELTA (subagente read-only, blueprint concluyente):**
+- **NO era timing ni error absorbido. Es cableado en la UI de wa_inbound (4820192), ruta imagen.** Flujo principal: módulo **24** (CallSub → 5069434, procesa captura) → **116** → **117**, en SERIE en la ruta de ÉXITO.
+- 116 y 117 debían ser el ERROR HANDLER del módulo 24 (clon de la rama Solo texto 112→114→115) pero quedaron pegados como módulos normales del flujo principal, NO colgando del conector de error. Por eso se ejecutan SIEMPRE que llega una imagen, después de que el 24 procesa la captura con éxito → SUCCESS + los 2 mensajes falsos.
+  - **116** = HTTP POST a Meta con "Disculpa, tuve un inconveniente tecnico...". **117** = CallSub a tool_notificar_humano (4883716) con motivo "error tecnico: wa_responder fallo" y contexto "...rama Solo texto" (huella del copy-paste, etiqueta nunca corregida). 117 tiene su propio onerror 131 (Ignore).
+- Evidencia numérica: ejecuciones de imagen e9fc1b62... (23:25) y cb4f60cf... (00:41) = **11 ops**; corridas de texto de la misma ventana = 10 ops. Las 2 ops extra = 116 y 117.
+- Hipótesis descartadas: H1 (onerror del 24 disparando pese a SUCCESS) → el 24 NO TIENE onerror. H3 (imagen cae a Solo texto) → filtro de Solo texto (mód 111) exige wa_msg_type ≠ image; ninguna corrida de wa_responder corresponde a las imágenes.
+- El hijo 5069434 está impecable: su interfaz (inputs cliente_wa_number/media_id; ReturnData mods 11/13/15 devuelven info_proceso) calza perfecto con el mapper del 24. NADA que tocar ahí.
+- **FIX (JC en UI — wa_inbound NUNCA por MCP):** borrar módulos **116 y 117** de la ruta imagen (al borrar 117 se va su Ignore 131). La ruta termina limpia en el 24. No se pierde cobertura (el 24 nunca tuvo handler propio). Opcional futuro: agregar error handler real colgado del 24 (Add error handler) con textos correctos "rama imagen".
+
+Estado al cierre: v63 entregado (por pegar+_v72), fix de falsa alarma entregado (por aplicar en UI). Pendiente cosmético modelo_usado hardcodeado (mód 20 de 5671936). Números JC y Camila siguen limpios de la sesión anterior.
+
+### 2026-07-21 (madrugada) — CORRECCIÓN de la falsa alarma de captura + limpieza de números
+**Corrijo la entrada anterior de esta sesión (la del subagente que decía "borrar 116/117 porque disparan en toda imagen"). JC frenó con evidencia y tenía razón. Diagnóstico corregido, verificado por mí LEYENDO el blueprint directo (no vía subagente):**
+
+- **NO es un error real. Es ruido.** En los 2 incidentes (20-jul 23:25 y 21-jul 00:41) los DOS hijos — tool_procesar_imagen (5069434) y tool_procesar_captura (5069377) — salieron SUCCESS con las MISMAS operaciones (7 y 11) que en la corrida buena de Camila del 18-jul. La captura se procesó, se guardó el monto, al operador le llegó "por validar". Todo verde. El "Disculpa, tuve un inconveniente técnico" + ATENCION son texto que se manda solo; no reaccionan a ninguna falla.
+- **Estructura REAL (verificada en el blueprint actual, líneas 1618/1704/2027, los 3 a la misma profundidad d8):** módulos 24, 116, 117 están en fila en el flujo principal de la ruta imagen. El 24 NO tiene onerror. 116/117 NO tienen filtro. Así, HOY, disparan en toda imagen. Pero eso es el estado ACTUAL, no el original.
+- **Reconciliación con "funcionó semanas y solo falló hoy":** Fable5 armó 116/117 el 17-jul como MANEJADOR DE ERROR del módulo 24 (así, solo disparaban si el 24 fallaba de verdad → por eso Camila 17-18 salió limpia). En algún momento se soltaron del conector de error y quedaron en el flujo principal (hay una edición de JC a wa_inbound el 21-jul 01:09, después de los 2 fallos; muy probablemente ahí se detachó el handler). Confirmación: capturas de prueba post-01:09 (01:21, 01:31) siguen en 11 ops.
+- **FIX CORRECTO (JC en UI, wa_inbound NUNCA por MCP) = RESTAURAR, no borrar:** clic derecho en módulo 24 → Add error handler → mover 116 y 117 a ese ramal punteado (dejar Ignore 131 al final) → corregir texto "rama Solo texto"→"rama imagen". Así vuelven a disparar solo si el 24 falla. Borrarlos también corta la falsa alarma pero pierde la red de seguridad (la captura igual notifica por mód 9/12 del 5069377). **JC decidió NO tocar wa_inbound hoy.** El monto grande fue COINCIDENCIA (116/117 ni ven el monto).
+- **Módulo 24 config:** CallSub → 5069434, "Wait for scenario to finish"=true, espera output info_proceso. Hijo calza perfecto. NO tocar 5069434/5069377 por este bug.
+- **Hallazgo aparte (pre-producción):** en 5069377, el mód 9 manda "CAPTURA PAGO POR VALIDAR" hardcodeado a 593998301965 (número de prueba de JC) y el mód 12 a 593984652033 (Camila). O sea capturas van a AMBOS hoy. Camila YA está cableada (no hace falta agregarla). Pendiente decisión JC: quitar su número de prueba del mód 9 (repuntar a Camila + eliminar 12 para no duplicar) — este sí editable por MCP.
+
+**LECCIÓN:** no delegar el diagnóstico estructural de un blueprint a subagente sin verificarlo yo; el subagente leyó bien la estructura (116/117 inline) pero saltó la conclusión ("borrar") sin considerar que era un handler detachado. La evidencia empírica del usuario ("funcionó para Camila") vale más que una inferencia de conteo de ops.
+
+**Limpieza de números (madrugada 21-jul):** e2e_preparar_run oficial. JC 593998301965: run 5130257f, backup e2e_backup.bk20260720_run5130257f (1 vendedor, 52 convs, 1 sesión, 33 notifs, 2 reservas), vendedor archivado _pre_e2e_20260720_2043, 1 reserva cancelada. Camila 593984652033: ya estaba virgen (0 en todo). Ambos en cero, listos para nuevas pruebas. v63 sigue SIN pegar (JC no hizo cambios hoy); config viva: gpt-5-mini/medium/12/v62/_v71.
+
+### 2026-07-21 — v63 pegado + bump _v72 (config viva)
+JC pegó promptPULGON_v63.txt y bumpeó threads a **_v72**. Config viva del Agent: gpt-5-mini, effort medium, history 12, **prompt v63**, **threads _v72**. Números JC y Camila ya limpios (limpieza previa de esta madrugada). Listo para nueva pasada de prueba (reserva+pago cliente nuevo) para verificar los 3 fixes de v63: §5b orden del cierre (registro antes de ¿confirmas?), producto-ya-nombrado=listado, solicitudes pendientes con el equipo. wa_inbound SIN tocar (falsa alarma de captura sigue viva por decisión de JC; el "Disculpa" técnico saldrá aunque la captura se procese bien — no es error real).
+
+### 2026-07-21 — Falsa alarma de imagen: CONFIRMACIÓN FINAL con prueba estructural lado a lado
+Nueva evidencia de JC: ahora TODA imagen dispara el falso "Disculpa"+ATENCION (incluida una de Camila que no era captura con mismatch) → comportamiento incondicional confirmado empíricamente. Prueba estructural en el blueprint vivo de wa_inbound (4820192):
+- **Rama Solo texto (BIEN):** flow = [111]; la cadena 112 (HTTP Disculpa) → 114 (CallSub notificar) → 115 (Ignore) está DENTRO del onerror del 111 (anidada d10). Solo dispara si el responder falla. Por eso los textos nunca dan falsa alarma.
+- **Rama imagen (BUG):** flow = [24, 116, 117] los tres en línea al mismo nivel (d8); el 24 SIN onerror; 117 con su propio Ignore 131. La cadena Disculpa+ATENCION está en la línea de ÉXITO → corre tras cada imagen.
+- **La trampa:** en el lienzo ambas ramas se ven idénticas (cadena alargada terminando en Skip); la única diferencia es línea punteada (error) vs sólida (éxito) entre el primer módulo y su cadena. El diseño "alargar el flujo para error handlers" era correcto — pero el alargue debe colgar del conector de error, como en Solo texto.
+- **Pasos de fix entregados a JC (UI):** borrar 116/117 del flujo → Add error handler en el 24 → reconstruir la cadena en el ramal punteado (clonar 112/114 de Solo texto sirve) → corregir textos a "tool_procesar_imagen fallo" / "rama imagen" → terminar en Ignore → verificar conexión punteada → probar con una imagen (debe quedar en silencio).
+
+### 2026-07-21/24 — FALSA ALARMA DE IMAGEN: ARREGLADA Y VERIFICADA EN BLUEPRINT
+JC aplicó el fix en la UI de wa_inbound (con Export Blueprint como respaldo previo): desenganchó 116/117 del flujo de éxito, creó error handler en el módulo 24 e insertó la cadena en el ramal punteado. Verificado por MCP (scenarios_get, solo lectura) tras el guardado:
+- **Rama imagen AHORA:** flow = [24]; onerror del 24 = [116 (HTTP Disculpa) → 117 (CallSub notificar) → 134 (Ignore)] — anidados d10, espejo exacto de la rama Solo texto (111 → onerror [112→114→115]).
+- **Textos del 117 corregidos:** motivo "error tecnico: tool_procesar_imagen fallo, revisar logs de Make", contexto "capturado por error handler de wa_inbound rama imagen". La rama texto conserva los suyos ("wa_responder fallo"/"rama Solo texto") — correcto.
+- El Skip viejo 131 fue reemplazado por el nuevo Ignore 134 en el rearmado.
+- CERRADO: el Disculpa+ATENCION en imágenes ya solo dispara con falla real del procesamiento. Pendiente solo la confirmación empírica (imagen de prueba → silencio).
+- La clave visual documentada para el futuro: en el lienzo de Make, cadena de error = conector "+ ○○○" (circulitos huecos) saliendo del módulo protegido; cadena en flujo de éxito = puntitos de color sólido. Ambas se ven casi iguales — revisar siempre el conector.
+
+### 2026-07-24 — Confirmación empírica del fix de falsa alarma ✔
+JC envió una imagen cualquiera (número limpio, sin reserva pendiente). Resultado: el bot respondió correcto ("Recibí tu imagen, pero todavía no tengo una reserva pendiente tuya...") y NO llegó ni el "Disculpa técnico" ni el ATENCION. Falsa alarma de imagen: CERRADA (estructural + empírica). Los 4 hallazgos de la prueba del 20-jul quedan atendidos; falta la pasada completa de JC (saludo→reserva→captura) para validar los 3 fixes de v63 en vivo.
+
+### 2026-07-24 — E2E R4 digerido: bloqueantes cazados + paridad admin + guía template v3
+**E2E Ronda 4 de Camila (run 5130257f, 29 etapas: 15 ok, 8 obs, 2 bloqueantes, 1 pendiente).** Los 2 bloqueantes eran 3 causas:
+1. **Vendedores archivados envenenando blasts (RESUELTO en DB):** los `_pre_e2e_*` seguían bloqueado=false → aparecían en picker de migración y sus reservas pagadas los hacían destinatarios del recordatorio; normalizarWa convierte el número renombrado en basura de 28 dígitos → Meta rechaza. El "1 de 2 fallido" del recordatorio era el vendedor JC archivado. Migración: template migracio_canal APPROVED (verificado en Graph API), ruta sana → los 3 intentos fallidos de Camila casi seguro por seleccionar archivados. **Migración `bloquear_vendedores_archivados_e2e`:** 8 archivados bloqueados + e2e_preparar_run ahora bloquea al archivar.
+2. **Mapa muere por ventana de 24h (bug real de producción, CONFIRMADO):** el mapa va como imagen LIBRE tras el HSM; Meta la acepta (wamid) y la descarta en silencio si el destinatario no escribió en 24h (último inbound de Camila: 33h antes). En producción mataría el mapa para casi todos. **Solución de fondo: template `wa_recordatorio_feria_v3` con el mapa como HEADER de imagen** → GUIA_TEMPLATE_RECORDATORIO_V3.md en raíz (empieza explicando el porqué, para Camila). Tras aprobación, cambiar la ruta para usar v3 (pendiente, una línea+components).
+3. **UI escondía los fallos (RESUELTO en código, por pushear):** 5 archivos PWA editados y escritos al disco de JC: blast-recordatorio/route.ts (filtro números válidos ^[0-9]{8,15}$, audit blast_recordatorio_fallido, tracking mapa_enviado/mapa_error con log estado=error, response con `resultados` completo), blast-recordatorio-button.tsx (tabla por destinatario SIEMPRE visible ✅/❌ + aviso mapa, caja ámbar si hay fallidos), vendedores/actions.ts (filtro + audit blast_migracion_fallido + resultados con nombre), blast-migracion-client.tsx (tabla por destinatario), api/vendedores/blast-migracion/route.ts (filtro+audit, ruta gemela).
+**Paridad admin JC+Camila (pedido de JC, HECHO):**
+- tool_notificar_humano (4883716) round-trip MCP verificado: flow [1,6,7,8,2,11,3,12,9,4]. Nuevos: mód 11 = ATENCION texto completo → Camila; mód 12 = template alerta_operadora → JC (param "JC"). Diseño: AMBOS reciben texto completo (best-effort, requiere ventana 24h abierta) + template garantizado (llega siempre) + campana PWA. Racional: el texto libre a JC también moriría en producción cuando deje de chatear a diario (misma ventana). Interface restaurada post-update (se vació, como siempre), re-fetch verificado.
+- vigia_destinatarios: Camila agregada (ahora JC + Camila).
+- Capturas por validar ya iban a ambos (mód 9 JC + mód 12 Camila en 5069377) — se queda así por paridad.
+**Pendientes del E2E R4 aún abiertos:** botones Sí/No de confirmación (diseño aprobado por JC: reply buttons de sesión, tool nueva + parseo interactive en wa_inbound UI + gate + prompt), prompt v64 (datos bancarios inmediatos, respuesta canónica mesa asignada, guion comida compacto), decisiones con Camila (imagen-no-captura con clasificación vision, acuerdos post-handoff con nota al devolver, editar/cancelar reserva en panel, visibilidad botón Reactivar), re-checks menores (05 percha, 14 TTL cuando expire, 25 push en /perfil).
+
+### 2026-07-24 — Botones de confirmación Sí/No (tool nueva) + promptPULGON v64
+**tool_enviar_confirmacion_reserva_sb creada por MCP (escenario 5752941, activo, interface seteada, folder 233340):**
+- Flujo: Start(cliente_wa_number, resumen) → Replace comillas/backslash→' (2) → Replace \n\r\t→literal \n (3) → HTTP mensaje interactive type=button a Meta (4): body = resumen + "\n\n¿Confirmas esta reserva?" + botones reply CONFIRMAR_SI('Sí, confirmo') / CONFIRMAR_NO('No, cambiar algo') → log conversaciones (5, estado ok, wamid) → ReturnData info_confirmacion (6, incluye nota al Agent de NO re-preguntar).
+- **Smoke test real OK:** ejecución 486550ff... SUCCESS, botones llegaron al número de JC; fila de log de prueba borrada (thread sigue virgen).
+- **Hallazgo clave que simplificó todo:** wa_inbound YA parsea botones — módulo 3 mapea wa_text = ifempty(text.body → interactive.button_reply.title → list_reply.title → button.text), y el filtro "Solo texto" (mód 111) solo exige type≠image → los taps entran como texto normal. CERO cambios en wa_inbound. Y el gate de 5066880 acepta 'Sí, confirmo' por dos vías (startsWith 'sí,' + contains 'confirm') → CERO cambios en el gate. Los mensajes interactive de sesión NO requieren template (ventana abierta garantizada: el cliente acaba de escribir).
+**promptPULGON_v64.txt en raíz (sobre v63, 7 reemplazos quirúrgicos verificados con assert):**
+1. §3c(iii-iv): con todos los datos + cliente registrado → invocar enviar_confirmacion_reserva (resumen SIN pregunta; la tool agrega pregunta+botones); respuesta de texto = 1 línea sin re-preguntar; FALLBACK a texto si la tool falla; turno siguiente: 'Sí, confirmo' → crear_reserva_tentativa, 'No, cambiar algo' → preguntar qué ajustar.
+2. §5: datos bancarios DE UNA VEZ con el aviso post-contrato (consultar_ferias_activas fresco, en líneas separadas, cierre 'mándame la captura por acá') — pedido de Camila etapa 06; prohibidos actualizados (se quitó 'mándame la captura (todavía no)' y 'aquí están los datos bancarios (no)').
+3. §2f NUEVA: respuesta canónica '¿qué mesa me tocó?' = 'Las mesas se asignan por orden de pago; el mapa con la ubicación de tu mesa se envía el sábado antes de la feria.' (etapa 09).
+4. REGLA GLOBAL 2: guion Quito/Chillos compactado, una idea por oración, reserva-aparte solo si rubro mixto (etapa 11); frase obligatoria 'la mesa de comida es aparte' conservada.
+5. §5b: cierre = enviar_confirmacion_reserva; consistencia datos bancarios en líneas en sección 'quiero pagar'.
+**PASOS MANUALES DE JC PENDIENTES:** (1) agregar tool_enviar_confirmacion_reserva_sb a las tools del AI Agent en la UI de Make (el escenario debe aparecer en el dropdown de tools del Agent), (2) pegar v64 en el prompt del Agent, (3) bump threads a _v73. Sin esos 3 pasos los botones no se usan (todo lo demás ya está vivo).
+
+### 2026-07-24 — Limpieza JC (run 1d2a4f70) + decisiones E2E + clasificación de imagen VIVA
+- JC pegó v64 + bump _v73 (verificado en responder; threadId quedó con un Enter final "_v73\n" — cosmético, borrar en próximo bump). Tool botones enlazada al Agent (visible en blueprint responder). Checklist completo entregado.
+- Número JC limpio (run 1d2a4f70, backup bk20260724_run1d2a4f70, 72 convs/1 sesión/1 handoff respaldados); el vendedor archivado salió bloqueado=true automáticamente → fix de limpieza endurecida CONFIRMADO en vivo.
+- Decisiones de JC (AskUserQuestion): etapa 10 → clasificar con IA; etapa 19 → nota al devolver al bot; etapa 24 → construir ambas (cancelar + cambiar feria en panel).
+- **CLASIFICACIÓN DE IMAGEN IMPLEMENTADA (5069377, round-trip verificado):**
+  - Data structure 360676 captura_extraida: + campo es_comprobante (text, aditivo).
+  - Prompt GPT (mód 4): ahora decide PRIMERO si es comprobante ('si'/'no'); ante duda 'si' (default seguro: nunca arriesgar un pago real).
+  - Router nuevo (mód 30) tras el feeder 7: Ruta 1 filtro es_comprobante≠'no' = flujo original intacto (PATCH 8 → operadores 9/12 → cliente 11 → log 13 → Return 10 con es_comprobante=si). Ruta 2 filtro ='no': mód 31 responde al cliente "Recibí tu imagen, pero no parece un comprobante..." + 32 log + 33 ReturnData es_comprobante=no (reserva NO tocada, equipo NO alertado).
+  - Interface restaurada post-update. PRUEBA pendiente: enviar imagen no-comprobante con reserva pendiente (debe responder neutro sin "validando") y una captura real (flujo igual que siempre).
+- PENDIENTES SIGUIENTES (aprobados, por construir): (B) acuerdos post-handoff — campo nota en "Devolver al bot" (PWA) que se guarda en sesiones.notas_session con marca [ACUERDO OPERADORA fecha] + regla prompt v65 "respeta acuerdos registrados"; (C) panel reservas — botón Cancelar reserva (motivo, libera puesto, HSM opcional) + Cambiar de feria (recalcula precio). Después: ruta recordatorio → template v3 cuando Camila lo apruebe en Meta.
+
+### 2026-07-24 — Pasada v64 de JC (parcial) + LECCIÓN: description-only también borra la interface
+- Pasada JC (cliente nuevo): **§5b VALIDADO** — el bot pidió registro (nombre/cédula/rubro) ANTES del cierre y preguntó ¿confirmas? UNA sola vez, monto correcto 48 USD. El doble-confirmas está muerto.
+- PERO el cierre salió por TEXTO, sin botones: el Agent no llamó enviar_confirmacion_reserva. CAUSA RAÍZ (screenshots de JC): la interface de 5752941 estaba VACÍA otra vez — mi scenarios_update de SOLO DESCRIPCIÓN (sin blueprint) también la borró. **LECCIÓN AMPLIADA: CUALQUIER scenarios_update (aunque sea description-only) vacía la interface → SIEMPRE re-set + verificar después.** Interface restaurada de nuevo (verificada).
+- JC además configuró en Tool settings del Agent: nombre "enviar_confirmacion_reserva" + descripción manual (toggle automático OFF) — bien.
+- Pasos JC: reabrir el diálogo de la tool en el Agent (los 2 campos reaparecen) → marcar "Let AI Agent decide" en ambos → Save. La pasada actual sigue por texto ('Sí'); los botones se validan en la próxima reserva.
+
+### 2026-07-24 — Pasada v64 (cont.): mensaje huérfano diagnosticado = retry de Meta sin dedup en ramas
+- Validados en vivo: datos bancarios DE UNA VEZ tras "mandame" (fix Camila etapa 06 ✓) y clasificación de imagen (foto no-comprobante → "no parece un comprobante", reserva intacta, sin POR VALIDAR fantasma ✓✓). Contrato itemizado ✓.
+- BUG NUEVO CAZADO: mensaje huérfano del bot ("¿Quieres que te mande los datos de pago otra vez...?") a las 16:45:32 SIN inbound del cliente entre medio. Causa: **retry de Meta re-dispara el Agent**. El dedup atómico EXISTE (mód 99 POST a processed_wamids con Prefer: resolution=ignore-duplicates → 1 fila si nuevo, 0 si duplicado) pero SOLO lo usa el filtro del mód 33 (rama audio). Las ramas imagen (24) y Solo texto (111) NO chequean wamid → el reintento no se loguea (índice único lo bloquea) pero SÍ re-invoca al responder → segunda respuesta del Agent (que improvisó un menú al ver el thread ya respondido). Mismo mecanismo del hallazgo "inbound duplicado" de la fase 2 del estrés.
+- **FIX entregado a JC (UI, wa_inbound nunca por MCP):** agregar condición AND `length(99.data) > 0` (Greater than, numeric) a los filtros "Solo texto" (111) y "Solo imagen" (24) — copiable del filtro del mód 33 "Solo si wamid es nuevo". También protege contra doble procesamiento de capturas en retry. PENDIENTE de que JC lo aplique.
+- Pendiente de la pasada: captura real (validar POR VALIDAR a ambos + cero falsa alarma). Pendiente menor: confirmar si los datos bancarios llegaron en líneas separadas o corridos (formato).
+
+### 2026-07-24 — Pasada v64 completada
+- **Captura real: BIEN PROCESADA** ✓ — sin falsa alarma técnica (el fix del error handler de imagen confirmado también en el flujo completo), POR VALIDAR entregado, flujo normal.
+- **Datos bancarios llegaron CORRIDOS** (una sola frase) — el Agent no emitió saltos de línea pese a la excepción de formato (regla línea 10 del prompt) y a v64 §5 "EN LÍNEAS SEPARADAS". El pipeline de newlines del responder (mód 21) está bien (verificado antes); es compliance del modelo. → **Cola para v65:** reforzar con ejemplo LITERAL multilínea del bloque de datos (banco/cuenta/titular/monto/referencia, uno por línea) en §5 y en la sección 'quiero pagar'.
+- **Balance de la pasada v64:** §5b orden del cierre ✓, un solo ¿confirmas? ✓, contrato itemizado ✓, datos bancarios inmediatos ✓ (formato pendiente), clasificación imagen no-comprobante ✓✓, captura real ✓, sin falsas alarmas ✓. Únicos abiertos: botones (validar en próxima reserva, interface ya restaurada + checkboxes marcados), dedup de retry en ramas de wa_inbound (fix entregado, JC por aplicar en UI), formato datos bancarios (v65).
+- **v65 (batch futuro, un solo paste):** (1) ejemplo literal multilínea de datos bancarios, (2) regla de acuerdos post-handoff ("respeta ACUERDO OPERADORA registrado en la sesión"), (3) si reaparece: refuerzo anti-menú. 
+- **Por construir (aprobados):** B) nota de acuerdo al "Devolver al bot" (PWA → sesiones.notas_session con marca [ACUERDO OPERADORA fecha]); C) panel reservas: Cancelar + Cambiar de feria. Luego: ruta recordatorio a template v3 cuando Camila lo tenga aprobado.
+
+### 2026-07-24 — Dedup de reintentos APLICADO en wa_inbound (UI, guiado con screenshots)
+JC agregó la condición `length(99.Data[]) > 0` (Numeric Greater than) como tercera regla AND en los filtros de AMBAS ramas del router: "Solo imagen" (junto a wa_msg_type=image y humano_activo≠true) y "Solo texto" (wa_msg_type≠image y humano_activo≠true). Verificado por screenshots antes del Save — idéntico al filtro del mód 33. Fallback: No en ambas. Con esto los retries de Meta mueren en el filtro: fin de los mensajes huérfanos del Agent y del riesgo de captura doble. Sanity check: mensaje nuevo debe responder 1 vez (el 99 inserta → length=1 → pasa). NOTA: la rama Log (104) queda sin la condición a propósito (índice único la protege; además loguear el retry no daña).
+
+### 2026-07-24 — Recordatorio migrado a template v3 (mapa como header)
+- Sanity check post-dedup OK (bot respondió 1 vez, sin huérfanos). Huérfano CERRADO.
+- Camila creó wa_recordatorio_feria_v3 y Meta lo APROBÓ (verificado por Graph API: HEADER IMAGE + BODY 7 vars, es).
+- blast-recordatorio/route.ts editado y escrito al disco (POR COMMITEAR): templateName = v3 si la feria tiene mapa_mesas_url (header image con link dinámico) / _v2 solo-texto si no hay mapa; sendMedia del mapa suelto ELIMINADO (moría por ventana 24h); mapa_enviado=true cuando va en header; log con template dinámico; idempotencia 20h contempla ambos templates (.in). Import sendMedia removido.
+- Pendiente cosmético: el texto de ejemplo del dry_run aún dice "En unos minutos te paso el mapa" (el template real v3 dice "Arriba tienes el mapa") — solo preview, ajustar en próximo touch.
+- Falta del paquete E2E: nota de acuerdos en release/route.ts + UI (ruta ya ubicada, 177 líneas, resumen handoff ya integrado ahí), Cancelar/Cambiar feria en panel, batch v65 (formato datos bancarios + regla acuerdos).
+
+### 2026-07-24 — CIERRE DE SESIÓN: pendiente ABIERTO recordatorio v3 no dispara
+**ESTADO ABIERTO (investigar en próxima sesión):** con deploy Ready (commit cf020f6 "fix: as const en header del template v3") y mapa_mesas_url CARGADO en Cumbayá 9-ago (verificado true en DB), el recordatorio SIGUE saliendo como _wa_recordatorio_feria_v2 sin imagen (3 intentos; borré los registros de idempotencia entre intentos, el último quedó en conversaciones). templateName = mapaMesasUrl ? v3 : v2 en app/api/ferias/[id]/blast-recordatorio/route.ts.
+HIPÓTESIS a probar (en orden): (1) ¿el preview del modal dice v2 o v3? (chivato clave: v3 en preview = código vivo y el fallo sería en el envío; v2 = el server no ve el mapa); (2) ¿hay DOS filas de feria Cumbayá 9-ago y el botón está en otra feria_id que no tiene mapa? — query: select id,nombre,fecha,mapa_mesas_url from ferias where nombre ilike '%cumbaya%'; (3) ¿RLS del client `supabase` (no admin) oculta/limita columnas de ferias?; (4) ¿deploy Ready pero dominio sirviendo build anterior (promote pendiente)? — verificar con Vercel MCP get_deployment/logs; (5) revisar en el repo que el cambio esté realmente en main (git log del archivo).
+DATOS: última fila enviada quedó ts~17:2X UTC template _wa_recordatorio_feria_v2 (NO la borré esta vez, considerar idempotencia 20h al reintentar — borrar antes: delete from conversaciones where wa_number='593998301965' and template_name like '%recordatorio%' and ts > now()-interval '3 hours').
+**Resto del día: TODO CERRADO Y VALIDADO** (ver entradas previas): falsa alarma imagen, blasts, paridad admin, botones (falta validar en próxima reserva), clasificación imagen, datos bancarios inmediatos (formato→v65), dedup retries aplicado (huérfano extinto), template v3 aprobado+ruta migrada (salvo este disparo).
+**COLA PRÓXIMA SESIÓN:** (1) resolver disparo v3 (hipótesis arriba); (2) nota de acuerdos en release/route.ts + textarea en inbox-client (devolverThread, línea ~546) + guardar en sesiones.notas_session con marca [ACUERDO OPERADORA fecha]; (3) Cancelar/Cambiar feria en panel reservas; (4) batch v65: ejemplo literal multilínea datos bancarios + regla acuerdos; (5) validar botones de confirmación en próxima reserva de prueba; (6) Ronda 5 de Camila cuando todo lo anterior esté.
+
+### 2026-07-24 (tarde) — Sesion Opus/Fable: mapa-campo-equivocado, silencio del Agent, newlines, panel reservas
+**Recordatorio v3 CERRADO:** la causa del "no dispara v3" era DATO, no codigo: Camila subio el mapa al campo AFICHE (arte_confirmacion_url) y mapa_mesas_url quedo "" (falsy → v2). "is not null" engano la verificacion previa: era cadena vacia. Camila re-subio bien, idempotencia borrada, recordatorio salio v3 con mapa en header (validado por JC). Efecto colateral: el AFICHE de Cumbaya 9-ago quedo vacio. Anti-repeticion: feria-form con hint por campo + window.confirm pre-subida que nombra el campo (afiche vs mapa) + botones diferenciados; preview del dry_run refleja el template real (commit a8aaeb4). **Autor de commits: usar SIEMPRE jotacelira@gmail.com, no jclira@** (un commit con el autor equivocado fue rechazado en el push).
+**Botones de confirmacion VALIDADOS:** tap 'Si, confirmo' → gate → reserva+contrato al primer intento. Latencia del cierre 92,7 s: tools 7,5 s, el resto vueltas LLM del Agent (no es regresion de botones). JC bajo effort a LOW.
+**Acuerdos post-handoff (commit 2b0f519):** ModalDevolver reemplaza el window.confirm del release — campo opcional "¿Acordaste algo?" → release/route.ts lo anexa a sesiones.notas como [ACUERDO OPERADORA fecha] ANTES de cerrar el handoff + audit_log + avisos en UI. El resumen automatico del handoff (opcion C) es efimero (una sola inyeccion): complementa, no reemplaza.
+**v65** (datos bancarios con bloque literal multilinea, regla de acuerdos, nombre de FERIA no de sede en el resumen) y **v66** (sentinela [SIN_MENSAJE]).
+**Doble CTA cazado:** brochure y botones remataban con eco porque el PROMPT lo obligaba. Fix de fondo = sentinela [SIN_MENSAJE] + router en el responder: si la respuesta la contiene, NO se envia a Meta y se loguea estado=silencio.
+**Round-trip MCP del responder 5671936 (CARO — ver feedback_costos):** mod 17 ya no aplana \n; mod 21 NUEVO escapa \n\r\t a literal para el JSON — **el fix de newlines del 19-jul NO estaba en el blueprint vivo, se habia perdido**: los "datos bancarios corridos" eran pipeline, no modelo. Ademas modelo_usado=gpt-5-mini y threadId sin el Enter fantasma.
+**BUG MIO POST-UPDATE:** el patron del mod 17 quedo ["\]+ (backslash escapando el corchete → regex invalida) → responder caido ~20 min para TODO texto; el error handler de wa_inbound disparo legitimo. Causa: heredoc de bash comio un backslash. Fix por UI en 30 s. **LECCION: contenido con backslashes nunca por heredoc.** El diagnostico fue 1 executions_list acotado (trae el error verbatim con modulo causante) — barato.
+**Panel reservas (commit 6119db5 + migracion cancelar_pagada_y_cambiar_feria_admin):** cancelar_reserva_admin acepta p_permitir_pagada → se pueden cancelar PAGADAS con doble confirmacion; RPC nuevo cambiar_feria_reserva (valida cupo/comida/fecha, recalcula monto con precios destino, libera puesto, historial en notas, devuelve diferencia).
+**Scheduler fantasma:** scheduler_recordatorio_feria_sb (5221014) mandaba wa_recordatorio_feria_v1 a numeros archivados y logueaba ok sin verificar; duplicaba al recordatorio v3 de la PWA. APAGADO. Si algun dia se automatiza, hacerlo con pg_cron → endpoint de la PWA.
+
+### 2026-07-27/28 — UX v2 (direccion B) en produccion + PERCHA: modelo falso erradicado
+**REDISEÑO UX v2 MERGEADO A MAIN.** JC eligio la direccion B ("fichas con estado") de 3 muestras HTML (artifact pulgon-ux-v2-direcciones). Convertido: lista de reservas, vendedores, ferias, detalle de reserva, y TABLERO NUEVO en inicio. Rama ux-v2-fichas → main (commits c8fb52f, 0d807f2, defe380, 5e1ef81). Patron: banda lateral 5px por estado + cifra protagonista en serif + accion contextual. NO se toco funcionalidad (props/handlers/queries intactos). Pendiente de convertir: formularios, notificaciones, ajustes/perfil, modales e INBOX (este ultimo merece pasada propia: 1400 lineas, es UI de chat, no lista de tarjetas; lo que si se traduce es la banda de color en la lista de conversaciones).
+**Tablero nuevo (inicio):** orden accionable→informativo. (1) Requiere tu atencion: capturas por validar + vencen hoy, cada fila con boton Validar/WhatsApp. (2) Proxima feria: cupo vendido y recaudado vs meta (meta = cupo x precio mesa completa; si se quiere meta explicita es columna nueva). (3) Pendientes de configuracion: ferias proximas sin afiche/mapa/reglamento — nacio del incidente del mapa. (4) Pipeline de ferias. (5) Esta semana + LATIDO DEL SISTEMA (hace cuanto respondio el bot, chats en manos humanas) — el vigia avisaba por WhatsApp pero no habia forma de verlo en el panel.
+**FIX iOS barra inferior:** la nav era `fixed bottom-0` + `backdrop-blur` con scroll de DOCUMENTO → iOS despega los fixed durante el momentum scroll. Fix: shell `h-dvh overflow-hidden`, main con `overflow-y-auto` en todas las anchuras, nav como hermano `shrink-0` (nunca fixed → nunca se despega); inbox pasa a `h-full`. Commit 2fab8e5.
+**Preview de rama en Vercel — leccion de entorno:** MIDDLEWARE_INVOCATION_FAILED en preview = faltaban NEXT_PUBLIC_SUPABASE_URL y NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY en el ambito Preview (estaban solo en Production; las demas 7 vars ya estaban en ambos). En la UI nueva de Vercel las vars viven DENTRO de cada Environment y no se pueden mover editando desde Production: hay que CREARLAS en Preview. **SUPABASE_SERVICE_ROLE_KEY se deja SOLO en Production a proposito** (salta RLS; que no ande en ramas de diseño es lo correcto — en preview fallan inbox/blasts/release y esta bien).
+**BUG DE FECHA (familia timezone, otra vez):** el tablero decia "es hoy" de ferias ya pasadas. Dos causas apiladas: (a) el cron auto_finalizar_ferias_pasadas corria a las 02:00 UTC = 21:00 Ecuador del dia ANTERIOR, asi que a la feria del domingo la cerraba recien el lunes 21:00 → REPROGRAMADO a 08:00 UTC (03:00 Ecuador); la funcion en si estaba bien escrita (usa America/Guayaquil). (b) diasHasta clampa negativos a 0. **Fix de fondo: el tablero filtra ferias por FECHA real en Ecuador, no solo por estado** — asi no depende de que el cron este al dia. Mismo criterio que con el mapa: no confiar en un campo que puede quedar desactualizado.
+**Templates Meta (revisados via Graph API, 23 plantillas):** wa_envio_contrato_v2 APROBADA y **CABLEADA** (5069350 mods 4 y 10, interface verificada) — el contrato ya no promete "avisame para enviarte los datos". **wa_reactivacion_v1 APROBADA PERO ROTA:** quedo en idioma **en** (ingles) y categoria MARKETING; el codigo envia language "es" → Meta responde 132001 y el blast falla para todos en silencio. Fix para Camila: agregar el idioma Español a esa misma plantilla (Meta identifica por nombre+idioma). Los dos handoff (tilde en "esta aqui", coma huerfana) SIGUEN sin corregir — y no hace falta version nueva: Meta permite EDITAR una plantilla aprobada. La wa_recordatorio_feria_v2 corta ya fue borrada.
+**E2E Ronda 5 de Camila (run 7da93da4, 13 etapas):** confirmado funcionando: datos bancarios en lineas separadas, devolver-al-bot con acuerdo ("¡Bien!"), blast de migracion (el bloqueante de la ronda pasada). Falso negativo en push (lo activo antes del run). Pedidos nuevos: reserva manual con percha y comida EXCLUYENTES, y que "ya pagada" NO bloquee el envio de contrato; y el grande — texto de confirmacion de pago por SEDE con toda la info operativa (ubicacion detallada, sector, parqueadero de ingreso, horarios, reglas), que ella propuso resolver como 3 textos fijos (uno por sede) con la fecha variable. Encaja con la tabla sedes.
+**PERCHA — el bug conceptual que motivo todo (CERRADO Y VALIDADO EN VIVO):** el sistema tenia DOS modelos conviviendo. El falso: "percha pequeña 5 USD / percha grande 10 USD" como si fueran dos productos. El real: UN permiso con medidas maximas segun tipo de mesa, cobrado simple si entra (5) o doble si excede (10). El modelo falso vivia en el prompt (tabla de precios espacio_percha_chica_addon/grande_addon + 2 reglas que ordenaban preguntar "¿pequeña o grande?") **Y en pulgon_faq.md** (lineas 32-33 y seccion "Tipos y costo"). Por eso arreglar solo el prompt no habria bastado: el bot consulta knowledge para preguntas de politica. **promptPULGON_v67.txt** erradica el modelo falso (prohibe las palabras, obliga a dar las medidas de SU tipo de mesa, y agrega la regla que faltaba: si el cliente da medidas concretas el bot RESUELVE la comparacion y dice el precio, no devuelve la pregunta). **pulgon_faq.md corregido** con advertencia explicita del error a evitar (el knowledge se consulta por similitud semantica: conviene que el documento nombre el error). Tambien se corrigio que el prompt decia "deja que el decida cuantas" contra la regla real "1 espacio por mesa sin excepcion". VALIDADO EN VIVO 28-jul: pregunta generica → medidas de su mesa en lineas separadas + 5/10 como simple/doble + pregunta si entra; y "mide 1.5x1.4x0.5" → "entra en las medidas, el espacio son 5 USD". LECCION: cuando una regla de negocio esta mal, buscarla en TODAS sus fuentes (prompt, knowledge, brochure, formulario, nombres de columnas) — el brochure estaba bien desde siempre, por eso el error sobrevivio meses.
+**KNOWLEDGE ORDENADO:** los 3 archivos que usa el Agent (filestorage 1c06c24c / 64801414 / 7659f460) son **pulgon_faq.md, pulgon_reglamento.md y pulgon_sedes.md, los de la RAIZ del repo**. La carpeta knowledge/ tenia 5 copias viejas que NO usa el bot pero confundian, con hasta 3 modelos distintos de percha (una llegaba a decir "las perchas que vendemos miden 1.5 la chica y 2 la grande", contradiciendo el "NO alquilamos perchas"). Las 5 movidas a knowledge/_deprecados/ tras verificar una por una que nada unico se perdia: REGLAMENTO_PULGON.md estaba declarado obsoleto por el propio pulgon_reglamento.md; guia_sedes_pulgui.md es subconjunto estricto de pulgon_sedes.md; GUIA_SEDES.md solo aportaba la regla de alimentos en cancha de Chillos, que esta en pulgon_sedes.md 144-146, pulgon_reglamento.md 69 y el prompt.
+**ABIERTOS TECNICOS:** (1) respuesta DUPLICADA cuando el cliente escribe en rafaga — Camila mando "Si" y "Confirmo" con 2 s de diferencia, dos ejecuciones independientes, ambas respondieron "mandame la captura". NO es el dedup de retries (ese mata wamids repetidos; estos son mensajes distintos y legitimos). Fix de fondo = agrupar mensajes del mismo cliente en una ventana corta antes de invocar al Agent, o descartar la respuesta si llego un inbound mas nuevo mientras el Agent pensaba. Toca wa_inbound. (2) escalar NO pausa al bot: dijo "te pongo en contacto con una persona del equipo" y siguio negociando precios 8 minutos hasta que Camila tomo el thread. Decidir si tras escalar se queda callado o responde lo minimo.
+**Config viva:** gpt-5-mini / effort low / history 12 / **prompt v67** / **threads _v75** / knowledge con pulgon_faq corregido.
+
+### 2026-07-28 (tarde) — Respuesta duplicada por rafaga CERRADA + orden real de mensajes (wa_ts)
+**ABIERTO TECNICO (1) CERRADO.** Fix con la decision en la BASE y receta de UI para Make, siguiendo el protocolo de costos (nada de round-trips de blueprint). `tool_debe_descartar_respuesta_sb(p_thread_id, p_wamid)` devuelve TRUE = descartar el envio; la llama el responder 5671936 justo antes del router. Se descarta SOLO el envio, nunca las tool calls, asi que no se pierde nada de lo que el cliente pidio: la ejecucion mas nueva contesta por todas y con mas contexto. Ante cualquier duda (wamid no encontrado, HTTP caido) devuelve FALSE = enviar: **el fallo seguro es responder de mas, nunca quedarse mudo.**
+**Cambio en Make (5671936), 3 pasos de UI:** modulo **27** nuevo (HTTP clonado del 16 para heredar los headers anon sin pegar el JWT) entre el Text parser 21 y el Router 25; ruta "enviar" gana una condicion **AND** `27.data` Not equal to `true`; ruta "silencio" gana un bloque **OR** `27.data` Equal to `true`. Clave: la ejecucion descartada cae por la rama de silencio y por lo tanto conserva su ReturnData — wa_inbound espera respuesta del subescenario. "Return error if HTTP request fails" = No en el 27, para que un Supabase caido no deje mudo al bot.
+**Observabilidad sin tocar Make:** cada descarte se inserta en audit_log con evento `respuesta_descartada_por_mensaje_nuevo` (wamid, ts del mensaje, ts del mas nuevo, cuantos). Truco general: cuando la instrumentacion en el orquestador cuesta cara, meterla dentro de la RPC.
+**SEGUNDO HALLAZGO (el test lo destapo):** el desempate por `conversaciones.ts` (hora de insercion) sale BARAJADO cuando WhatsApp entrega los mensajes en lote — 3 mensajes en 74 ms y el orden en base no fue el de envio, porque Make corre las ejecuciones en paralelo y gana la que termina primero. Efecto: se responde al mensaje menos interesante del lote (contesto "que tal" e ignoro "quier reservar"). Fix: columna **`conversaciones.wa_ts`** con el timestamp que manda Meta, que si refleja el orden de envio.
+**wa_inbound tocado por UI, UN SOLO CAMPO:** modulo 104 (RPC tool_log_inbound_sb), al final del Body content se agrego `,"p_wa_ts":"{{3.wa_timestamp}}"`. La variable `3.wa_timestamp` ya existia en el modulo 3 desde siempre, no hubo que crearla. `tool_log_inbound_sb` recibe `p_wa_ts` **opcional**: si no llega, o llega basura, se comporta igual que antes → cero ventana de riesgo mientras JC editaba. Se hizo **drop + create en la misma migracion** (agregar un parametro con DEFAULT via CREATE OR REPLACE crearia una sobrecarga y PostgREST no sabria cual llamar).
+**Desempate final:** comparacion de tuplas `(coalesce(wa_ts, ts), ts)`. Meta tiene resolucion de 1 segundo, asi que ante empate cae al orden de insercion (comportamiento anterior). Mejora real, no perfecta.
+**VALIDADO EN VIVO 28-jul 17:27:** "hola" / "que tal" / "quiero reservar" con wa_ts 17:26:58 / 17:27:01 / 17:27:04, dos descartes logueados, UNA sola respuesta y fue la del ultimo mensaje (ofrecio las tres ferias). Detalle que justifica el mecanismo: la ejecucion de "que tal" recien termino de pensar 13 s DESPUES de que ya se habia enviado la buena; sin el chequeo habria llegado descolgada.
+**ABIERTO TECNICO (2) escalar-no-pausa CERRADO por relectura:** el bot hizo lo diseñado (acuso recibo del pedido pendiente y contesto la pregunta de politica); el defecto real de ese log era la respuesta equivocada de percha, ya corregida en v68. Se reabre solo si Camila ve otro caso.
+**METODO REUTILIZABLE:** para probar funciones que escriben (audit_log, conversaciones) sin ensuciar produccion ni disparar los triggers de notificacion, envolver el test en un bloque `do $$ ... raise exception 'resultados: %', x; end $$;` — la excepcion devuelve los valores en el mensaje de error y revierte todo. Se uso para validar el caso real antes de tocar Make.
+**Config viva:** gpt-5-mini / effort low / history 12 / **prompt v68** / **threads _v76** / knowledge = pulgon_faq.md + pulgon_reglamento.md + pulgon_sedes.md de la raiz.
+
+### 2026-07-28 (cierre) — El guion del E2E se habia quedado atras del producto (commit 962098b)
+**PATRON A VIGILAR:** cada vez que un run de Camila genera cambios en el producto, el cambio deja **desactualizado al test**, y nadie lo nota porque el guion no falla solo. El caso feo de esta ronda: `05_reserva_percha` (que ademas es **smoke**, o sea sale en el run corto) le pedia a Camila verificar que el bot pregunte "¿percha pequeña 5 o grande 10?" — exactamente el bug que el v68 erradico. Si corria asi, marcaba BLOQUEANTE el comportamiento correcto. **Regla: cerrar un pedido del E2E incluye actualizar la etapa que lo prueba, en el mismo commit.**
+**Correcciones aplicadas a `pwa/lib/e2e/etapas.ts`:** percha al modelo real (medidas por tipo de mesa, 5 si entra / 10 si excede, el bot resuelve la comparacion); `11_comida` prueba la exclusion percha/comida; `20_validar_pago` espera **DOS** mensajes (confirmacion + instrucciones de la sede, que era el pedido grande de la ronda 5); `24_blast_recordatorio_feria` pasa a v3 con mapa en el header (v2 es fallback) y avisa del campo mapa-vs-afiche; `06_post_contrato` incluye que el HSM ya no promete mandar los datos de pago (wa_envio_contrato_v2); `21_reserva_manual` cubre la exclusion en el formulario y el contrato aunque se marque ya pagada.
+**Etapas nuevas:** `29_rafaga_mensajes` (SMOKE, 30 segundos: tres mensajes seguidos → una sola respuesta y que conteste al ultimo), `30_cambiar_feria`, `31_cancelar_pagada` (solo admin), `32_ajustes_sedes`. `24_navegacion` ahora cubre los cinco bloques del tablero y la barra inferior en iOS. Smoke quedo en **12 etapas**.
+**Convencion del archivo:** el numero del codigo NO define el orden (el orden es el del array); las etapas nuevas llevan numeros altos aunque se muestren en medio, para no renombrar codigos viejos y dejar huerfanos los feedbacks anteriores. Las etapas nuevas van con `tiene_checks: false` — no hizo falta tocar `e2e_verificar_etapa`, y los checks de las corregidas seguian bien porque miran DATOS (reserva creada, TTL, monto), no el texto del bot. **Si Camila tiene un run abierto, las etapas nuevas le aparecen como pendientes a mitad de camino: conviene arrancar run nuevo.**
+**`wa_reactivacion_v1` NO esta reemplazada (duda recurrente):** es el boton "Reactivacion" del detalle de feria — idea de Camila del 18-jul, empuja a los vendedores que recibieron la invitacion de esa feria pero no tienen reserva viva en ella (2 vars, idempotencia 48 h por vendedor). Las que si tuvieron version nueva son otras: recordatorio v2→v3 (mapa en el header) y contrato → wa_envio_contrato_v2. Y `wa_migracion_canal_v1` es el blast de migracion, cosa distinta. Sigue rota por idioma (creada en **en**, el codigo pide **es** → 132001, falla para toda la lista en silencio); el fix es agregar el idioma Español a ESA misma plantilla, no crear otra, porque una plantilla nueva con otro nombre obligaria a tocar codigo.
